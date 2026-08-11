@@ -4,7 +4,7 @@
 #
 # On a fresh Linux Mint machine:
 #
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/exerunner/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/kw0175/exerunner/main/install.sh | bash
 #
 # Or from a clone:
 #
@@ -15,7 +15,7 @@
 #
 set -euo pipefail
 
-REPO="${EXERUNNER_REPO:-OWNER/exerunner}"
+REPO="${EXERUNNER_REPO:-kw0175/exerunner}"
 BRANCH="${EXERUNNER_BRANCH:-main}"
 RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 

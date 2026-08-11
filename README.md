@@ -3,7 +3,7 @@
 Run Windows programs on Linux without the usual Wine misery.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/exerunner/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/kw0175/exerunner/main/install.sh | bash
 exerunner doctor
 ```
 
@@ -31,7 +31,7 @@ Almost every "I tried Wine and it was a nightmare" story is one of five things:
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/exerunner/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/kw0175/exerunner/main/install.sh | bash
 ```
 
 Installs to `~/.local` only. It'll offer to `apt install` anything missing —
@@ -40,7 +40,7 @@ Wine, winetricks, icoutils — and you can decline.
 From a clone instead:
 
 ```bash
-git clone https://github.com/OWNER/exerunner.git
+git clone https://github.com/kw0175/exerunner.git
 cd exerunner && ./install.sh
 ```
 
