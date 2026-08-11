@@ -1,0 +1,7 @@
+# Everything here runs on Linux. A CRLF checkout breaks the shell scripts with
+# "bash: $'\r': command not found" and the Python entry points with a bad
+# shebang, so pin LF regardless of the platform doing the checkout.
+* text=auto eol=lf
+*.sh    text eol=lf
+*.py    text eol=lf
+*.md    text eol=lf

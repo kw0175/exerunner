@@ -1,0 +1,1776 @@
+#!/usr/bin/env python3
+"""
+exerunner - a per-app Wine prefix manager for Linux Mint Cinnamon.
+
+Wine is the engine; this is the part that's usually missing. It gives every
+Windows app its own isolated prefix, installs the runtimes that app needs,
+keeps logs when things break, and wires the result into the Cinnamon menu.
+
+  exerunner doctor              check the system is set up to run Windows apps
+  exerunner install setup.exe   install an app into its own prefix
+  exerunner list                show installed apps
+  exerunner run <name>          launch one
+  exerunner logs <name>         see why the last launch failed
+  exerunner shell <name>        winecfg / regedit / explorer / a shell in a prefix
+  exerunner open <file.exe>     run a loose .exe (double-click handler)
+  exerunner runners             manage alternative Wine builds
+  exerunner gui                 graphical front end
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+VERSION = "1.0.0"
+
+# --------------------------------------------------------------------------
+# paths
+# --------------------------------------------------------------------------
+
+DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "exerunner"
+APPS = DATA / "apps"
+RUNNERS = DATA / "runners"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "exerunner"
+DESKTOP_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "applications"
+
+# The DirectX helper DLLs games actually bundle and expect. Wine implements
+# DirectX itself - these are only the redistributable extras.
+DIRECTX = [
+    "d3dx9", "d3dx10", "d3dx11_43",
+    "d3dcompiler_43", "d3dcompiler_47",
+    "xact", "xact_x64",
+]
+
+# Runtime bundles. These are winetricks verbs; the names are stable.
+PRESETS = {
+    "app": ["corefonts", "vcrun2022", "msxml6", "gdiplus"],
+    "dotnet": ["corefonts", "vcrun2022", "dotnet48"],
+    "directx": DIRECTX,
+    "game": ["corefonts", "vcrun2022"] + DIRECTX + ["dxvk"],
+    "media": ["corefonts", "vcrun2022", "quartz", "devenum", "gdiplus"],
+    "full": (
+        ["corefonts", "tahoma",
+         "vcrun2005", "vcrun2008", "vcrun2010", "vcrun2012", "vcrun2013", "vcrun2022",
+         "msxml3", "msxml6", "gdiplus", "mfc42", "quartz", "devenum"]
+        + DIRECTX
+    ),
+    "minimal": [],
+}
+
+# Microsoft's own redistributable installers cannot work under Wine - they rely
+# on Windows Update plumbing that does not exist. winetricks is the way in.
+REDIST_INSTALLER = re.compile(
+    r"(dxwebsetup|dxsetup|directx.*(setup|redist)|vcredist|vc_redist|"
+    r"dotnetfx|ndp\d+|windowsdesktop-runtime)",
+    re.I,
+)
+
+# Noise to strip out of an installer's filename when guessing a display name.
+FILENAME_NOISE = re.compile(
+    r"(?:^|[\s._-])(?:v?\d+(?:[._]\d+)+|installer|install|setup|"
+    r"x64|x86|win64|win32|win|64bit|32bit|amd64|full|final|portable|latest)"
+    r"(?=$|[\s._-])",
+    re.I,
+)
+
+# Executables that turn up inside a prefix after an install but are never the app.
+# Wine ships these in every prefix, so they are never the app you installed.
+# Matched as WHOLE names: "notepad" must not knock out "notepad++", which is
+# exactly the bug substring matching caused here.
+WINE_BUILTINS = {
+    "attrib", "cabarc", "cmd", "conhost", "control", "dxdiag", "eject",
+    "expand", "explorer", "extrac32", "fsutil", "hh", "icinfo", "iexplore",
+    "lodctr", "mshta", "msiexec", "net", "netstat", "notepad", "oleview",
+    "ping", "plugplay", "presentationfontcache", "reg", "regedit", "regsvr32",
+    "rpcss", "rundll32", "sc", "schtasks", "secedit", "services", "shutdown",
+    "spoolsv", "start", "subst", "systeminfo", "taskmgr", "tasklist",
+    "typeperf", "unlodctr", "wevtutil", "where", "whoami", "wineboot",
+    "winecfg", "wineconsole", "winedbg", "winedevice", "winefile",
+    "winemenubuilder", "winemine", "winepath", "winhlp32", "winver",
+    "wmic", "wmplayer", "wordpad", "write", "wusa", "xcopy", "xwizard",
+}
+
+# Substring patterns. Safe as substrings because no real application name
+# contains these innocently.
+NOT_THE_APP = re.compile(
+    r"(unins|uninst|setup|vcredist|vc_redist|dotnetfx|dxsetup|dxwebsetup|"
+    r"crashpad|crashhandler|crashreport|updater|redist)",
+    re.I,
+)
+
+
+def is_not_the_app(filename):
+    """True when this executable is scaffolding rather than the installed app."""
+    stem = Path(filename).stem.lower()
+    return stem in WINE_BUILTINS or bool(NOT_THE_APP.search(stem))
+
+# --------------------------------------------------------------------------
+# output
+# --------------------------------------------------------------------------
+
+_tty = sys.stdout.isatty()
+
+
+def _c(code, s):
+    return f"\033[{code}m{s}\033[0m" if _tty else s
+
+
+def info(s):
+    print(f"{_c('36', '::')} {s}")
+
+
+def ok(s):
+    print(f"{_c('32', ' ok ')} {s}")
+
+
+def warn(s):
+    print(f"{_c('33', 'warn')} {s}")
+
+
+def fail(s):
+    print(f"{_c('31', 'FAIL')} {s}")
+
+
+def die(s, code=1):
+    fail(s)
+    sys.exit(code)
+
+
+def ask(prompt, default=None):
+    suffix = f" [{default}]" if default else ""
+    try:
+        answer = input(f"{_c('36', '??')} {prompt}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(130)
+    return answer or (default or "")
+
+
+def ask_yes(prompt, default=True):
+    hint = "Y/n" if default else "y/N"
+    answer = ask(f"{prompt} ({hint})").lower()
+    if not answer:
+        return default
+    return answer.startswith("y")
+
+
+# --------------------------------------------------------------------------
+# small utilities
+# --------------------------------------------------------------------------
+
+
+def slugify(name):
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return slug or "app"
+
+
+def name_from_filename(stem):
+    """Turn 'npp.8.9.6.2.Installer.x64' into something fit for a menu entry."""
+    cleaned = FILENAME_NOISE.sub(" ", stem)
+    cleaned = re.sub(r"[._-]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -")
+    # A short trailing number is a build counter, not part of the name. Four
+    # digits are left alone so things like "Photoshop 2024" survive.
+    cleaned = re.sub(r"\s+\d{1,2}$", "", cleaned)
+    return cleaned or stem
+
+
+def which(binary):
+    return shutil.which(binary)
+
+
+def capture(cmd, **kwargs):
+    """Run a command, return (returncode, combined output). Never raises."""
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            timeout=kwargs.pop("timeout", 60),
+            **kwargs,
+        )
+        return proc.returncode, proc.stdout.strip()
+    except FileNotFoundError:
+        return 127, ""
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    except OSError as exc:
+        return 1, str(exc)
+
+
+def stream(cmd, env=None, cwd=None, log_path=None, on_line=None):
+    """Run a command, tee output to a log file and an optional callback."""
+    log_file = None
+    if log_path:
+        log_path = Path(log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file = log_path.open("a", encoding="utf-8", errors="replace")
+        log_file.write(f"\n===== {datetime.now().isoformat(timespec='seconds')} :: {' '.join(map(str, cmd))}\n")
+
+    try:
+        proc = subprocess.Popen(
+            [str(c) for c in cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            bufsize=1,
+            env=env,
+            cwd=str(cwd) if cwd else None,
+        )
+    except FileNotFoundError:
+        if log_file:
+            log_file.close()
+        raise
+
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        if log_file:
+            log_file.write(line + "\n")
+            log_file.flush()
+        if on_line:
+            on_line(line)
+        else:
+            print(f"   {line}")
+    proc.wait()
+
+    if log_file:
+        log_file.write(f"===== exit {proc.returncode}\n")
+        log_file.close()
+    return proc.returncode
+
+
+def wait_idle(env, timeout=20):
+    """Let the prefix settle, but never block indefinitely.
+
+    Installers routinely launch the app as their last act, which keeps
+    wineserver alive. An unbounded wait would then hang until the user closed
+    the app by hand, so we give up after `timeout` and carry on.
+    """
+    try:
+        subprocess.run(
+            [env.get("WINESERVER", "wineserver"), "-w"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+    except OSError:
+        return False
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}GB"
+
+
+# --------------------------------------------------------------------------
+# runners (Wine builds)
+# --------------------------------------------------------------------------
+
+# Layouts we understand: plain wine builds (bin/wine), Proton-style (files/bin/wine),
+# and Lutris-style (dist/bin/wine).
+RUNNER_LAYOUTS = ("bin/wine", "files/bin/wine", "dist/bin/wine")
+
+
+def runner_root(name):
+    """Return the directory holding bin/wine for a runner, or None."""
+    if name in ("system", "", None):
+        return None
+    base = RUNNERS / name
+    if not base.is_dir():
+        return None
+    for layout in RUNNER_LAYOUTS:
+        candidate = base / layout
+        if candidate.exists():
+            return candidate.parent.parent
+    # A tarball that extracted with its own top-level directory.
+    for child in sorted(base.iterdir()):
+        if not child.is_dir():
+            continue
+        for layout in RUNNER_LAYOUTS:
+            if (child / layout).exists():
+                return (child / layout).parent.parent
+    return None
+
+
+def resolve_wine(runner):
+    """Return (wine_binary, runner_root_or_None). Exits if nothing usable."""
+    if runner in ("system", "", None):
+        wine = which("wine")
+        if not wine:
+            die("Wine is not installed. Run: exerunner doctor")
+        return wine, None
+    root = runner_root(runner)
+    if not root:
+        die(f"Runner '{runner}' not found or has no bin/wine. Try: exerunner runners list")
+    return str(root / "bin" / "wine"), root
+
+
+def list_runners():
+    found = ["system"]
+    if RUNNERS.is_dir():
+        for child in sorted(RUNNERS.iterdir()):
+            if child.is_dir() and runner_root(child.name):
+                found.append(child.name)
+    return found
+
+
+def wine_env(prefix, runner="system", arch=None, extra=None, debug=None):
+    """Build the environment for a wine invocation against a given prefix."""
+    wine, root = resolve_wine(runner)
+    env = os.environ.copy()
+    env["WINEPREFIX"] = str(prefix)
+    env["WINE"] = wine
+    # Only meaningful when the prefix is being created; setting it on an
+    # existing prefix of the other architecture makes wine refuse to start.
+    if arch:
+        env["WINEARCH"] = arch
+    env["WINEDEBUG"] = debug or "-all"
+
+    # Stop Wine scattering its own .desktop files through the Cinnamon menu.
+    # We generate menu entries ourselves, deliberately.
+    overrides = [o for o in env.get("WINEDLLOVERRIDES", "").split(";") if o]
+    if not any(o.startswith("winemenubuilder.exe") for o in overrides):
+        overrides.append("winemenubuilder.exe=d")
+    env["WINEDLLOVERRIDES"] = ";".join(overrides)
+
+    if root:
+        env["WINESERVER"] = str(root / "bin" / "wineserver")
+        env["WINELOADER"] = wine
+        env["PATH"] = f"{root / 'bin'}{os.pathsep}{env.get('PATH', '')}"
+        for libdir in ("lib64", "lib"):
+            path = root / libdir
+            if path.is_dir():
+                env["LD_LIBRARY_PATH"] = f"{path}{os.pathsep}{env.get('LD_LIBRARY_PATH', '')}"
+    if extra:
+        env.update({k: str(v) for k, v in extra.items()})
+    return env, wine
+
+
+# --------------------------------------------------------------------------
+# app manifests
+# --------------------------------------------------------------------------
+
+
+def app_dir(slug):
+    return APPS / slug
+
+
+def manifest_path(slug):
+    return app_dir(slug) / "manifest.json"
+
+
+def load_app(slug):
+    path = manifest_path(slug)
+    if not path.exists():
+        die(f"No app called '{slug}'. Run: exerunner list")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_app(manifest):
+    path = manifest_path(manifest["slug"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def all_apps():
+    if not APPS.is_dir():
+        return []
+    out = []
+    for child in sorted(APPS.iterdir()):
+        path = child / "manifest.json"
+        if path.exists():
+            try:
+                out.append(json.loads(path.read_text(encoding="utf-8")))
+            except json.JSONDecodeError:
+                warn(f"{child.name}: manifest.json is corrupt, skipping")
+    return out
+
+
+# --------------------------------------------------------------------------
+# prefix creation and winetricks
+# --------------------------------------------------------------------------
+
+
+def create_prefix(prefix, runner, arch, log_path, on_line=None, no_gecko=False, no_mono=False):
+    prefix = Path(prefix)
+    prefix.mkdir(parents=True, exist_ok=True)
+    env, _ = wine_env(prefix, runner, arch=arch)
+    if no_gecko or no_mono:
+        skips = []
+        if no_gecko:
+            skips.append("mshtml=d")
+        if no_mono:
+            skips.append("mscoree=d")
+        env["WINEDLLOVERRIDES"] = ";".join([env["WINEDLLOVERRIDES"]] + skips)
+    code = stream([env["WINE"], "wineboot", "-u"], env=env, log_path=log_path, on_line=on_line)
+    wait_idle(env)
+    return code
+
+
+def run_winetricks(prefix, runner, verbs, log_path, on_line=None):
+    if not verbs:
+        return 0
+    winetricks = which("winetricks")
+    if not winetricks:
+        warn("winetricks is not installed - skipping runtime install.")
+        warn("  sudo apt install winetricks")
+        return 127
+    env, _ = wine_env(prefix, runner)
+    env["WINETRICKS_LATEST_VERSION_CHECK"] = "disabled"
+    cmd = [winetricks, "-q", "--force"] + list(verbs)
+    return stream(cmd, env=env, log_path=log_path, on_line=on_line)
+
+
+def set_winver(prefix, runner, winver, log_path, on_line=None):
+    if not winver:
+        return 0
+    return run_winetricks(prefix, runner, [winver], log_path, on_line)
+
+
+# --------------------------------------------------------------------------
+# finding the installed executable
+# --------------------------------------------------------------------------
+
+
+def lnk_targets(path):
+    """Pull .exe paths out of a Windows shortcut without a full .lnk parser.
+
+    Shortcuts store their target as both ASCII and UTF-16 strings; scanning for
+    them is crude but it is how you find the entry point the installer intended.
+    """
+    try:
+        blob = path.read_bytes()
+    except OSError:
+        return []
+    found = []
+    for text in (blob.decode("latin-1", "ignore"), blob.decode("utf-16-le", "ignore")):
+        for match in re.finditer(r"[A-Za-z]:\\\\?[^\x00\r\n<>|\"]{2,200}?\.exe", text):
+            found.append(match.group(0).replace("\\\\", "\\"))
+    return found
+
+
+def win_to_unix(prefix, winpath):
+    """Map C:\\foo\\bar.exe onto the prefix's drive_c, case-insensitively."""
+    match = re.match(r"^([A-Za-z]):\\(.*)$", winpath)
+    if not match or match.group(1).lower() != "c":
+        return None
+    parts = [p for p in match.group(2).split("\\") if p]
+    current = Path(prefix) / "drive_c"
+    for part in parts:
+        if not current.is_dir():
+            return None
+        for entry in current.iterdir():
+            if entry.name.lower() == part.lower():
+                current = entry
+                break
+        else:
+            return None
+    return current if current.is_file() else None
+
+
+def find_candidates(prefix, since=None):
+    """Rank the .exe files in a prefix by how likely each is to be the app."""
+    prefix = Path(prefix)
+    drive_c = prefix / "drive_c"
+    if not drive_c.is_dir():
+        return []
+
+    scored = {}
+
+    # Strongest signal: whatever the installer put in the Start Menu.
+    for start_menu in drive_c.rglob("Start Menu/**/*.lnk"):
+        for target in lnk_targets(start_menu):
+            resolved = win_to_unix(prefix, target)
+            if resolved and not is_not_the_app(resolved.name):
+                scored[resolved] = scored.get(resolved, 0) + 1000
+
+    skip_dirs = {"windows", "winsxs", "temp", "tmp"}
+    for exe in drive_c.rglob("*.exe"):
+        try:
+            rel = exe.relative_to(drive_c)
+        except ValueError:
+            continue
+        if any(part.lower() in skip_dirs for part in rel.parts[:2]):
+            continue
+        try:
+            stat = exe.stat()
+        except OSError:
+            continue
+
+        score = 0
+        if is_not_the_app(exe.name):
+            score -= 500
+        if since and stat.st_mtime >= since - 5:
+            score += 200
+        if rel.parts and rel.parts[0].lower().startswith("program files"):
+            score += 100
+        score += min(stat.st_size / (1024 * 1024), 60)  # bigger binary, likelier the app
+        score -= len(rel.parts) * 5  # deeply buried helpers are less likely
+        scored[exe] = scored.get(exe, 0) + score
+
+    ranked = sorted(scored.items(), key=lambda kv: kv[1], reverse=True)
+    return [path for path, score in ranked if score > -400][:25]
+
+
+# --------------------------------------------------------------------------
+# desktop integration
+# --------------------------------------------------------------------------
+
+
+def extract_icon(exe_path, dest_png, slug=None):
+    """Pull the app's real icon out of its .exe, with fallbacks.
+
+    A generic cog on every menu entry makes the whole thing feel like a hack,
+    so this tries several routes before giving up.
+    """
+    wrestool, icotool = which("wrestool"), which("icotool")
+    dest_png = Path(dest_png)
+    dest_png.parent.mkdir(parents=True, exist_ok=True)
+    work = dest_png.parent / "_icon"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    candidates = []
+
+    if wrestool and icotool:
+        # Resource type 14 is the icon *group* an app advertises as its main
+        # icon; type 3 is the individual icons. Try both.
+        for res_type in ("14", "3"):
+            ico = work / f"res{res_type}.ico"
+            code, _ = capture([wrestool, "-x", "-t", res_type, str(exe_path), "-o", str(ico)])
+            if code == 0 and ico.exists() and ico.stat().st_size > 0:
+                capture([icotool, "-x", "-o", str(work), str(ico)])
+        candidates += list(work.glob("*.png"))
+
+    # Many apps ship a .ico beside the executable; use it if the exe gave nothing.
+    if not candidates and icotool:
+        for sibling in sorted(Path(exe_path).parent.glob("*.ico"))[:5]:
+            capture([icotool, "-x", "-o", str(work), str(sibling)])
+        candidates += list(work.glob("*.png"))
+
+    result = None
+    if candidates:
+        if slug:
+            install_theme_icons(slug, candidates)
+        # Keep a single copy for the GUI's list view. 128px is plenty and
+        # avoids handing a 256px image to anything that renders it natively.
+        best = pick_icon_size(candidates, prefer=128)
+        if best and best.stat().st_size > 0:
+            shutil.copy2(best, dest_png)
+            result = dest_png
+
+    shutil.rmtree(work, ignore_errors=True)
+    return result
+
+
+# icotool names its output <base>_<index>_<width>x<height>x<depth>.png
+ICON_SIZE_RE = re.compile(r"_(\d+)x(\d+)x\d+\.png$")
+
+STANDARD_ICON_SIZES = (16, 22, 24, 32, 48, 64, 72, 96, 128, 192, 256, 512)
+
+
+def icon_dimensions(png):
+    match = ICON_SIZE_RE.search(png.name)
+    if not match:
+        return None
+    width, height = int(match.group(1)), int(match.group(2))
+    return width if width == height else None
+
+
+def pick_icon_size(candidates, prefer=128):
+    """Closest square icon at or below `prefer`, else the biggest available."""
+    sized = [(icon_dimensions(p), p) for p in candidates]
+    sized = [(s, p) for s, p in sized if s]
+    if not sized:
+        return max(candidates, key=lambda p: p.stat().st_size)
+    at_or_below = [(s, p) for s, p in sized if s <= prefer]
+    if at_or_below:
+        return max(at_or_below, key=lambda sp: sp[0])[1]
+    return min(sized, key=lambda sp: sp[0])[1]
+
+
+def hicolor_dir():
+    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "icons" / "hicolor"
+
+
+# Windows icons usually fill their bitmap edge to edge; Linux icon themes
+# leave breathing room. Without a margin an extracted icon looks oversized
+# beside everything else on the desktop even at identical dimensions.
+ICON_PADDING = 0.12
+
+
+def scale_png(src, dest, size, padding=ICON_PADDING):
+    """Write a size x size copy of src, centred inside a transparent margin."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    inner = max(1, int(round(size * (1 - padding * 2))))
+
+    try:
+        import gi
+
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf
+
+        scaled = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(src), inner, inner, True)
+        canvas = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, size, size)
+        canvas.fill(0x00000000)  # fully transparent
+        width, height = scaled.get_width(), scaled.get_height()
+        offset_x, offset_y = (size - width) // 2, (size - height) // 2
+        scaled.copy_area(0, 0, width, height, canvas, offset_x, offset_y)
+        canvas.savev(str(dest), "png", [], [])
+        return True
+    except Exception:
+        pass
+
+    for tool in ("magick", "convert"):
+        if which(tool):
+            code, _ = capture([
+                tool, str(src), "-resize", f"{inner}x{inner}",
+                "-background", "none", "-gravity", "center",
+                "-extent", f"{size}x{size}", str(dest),
+            ])
+            if code == 0 and dest.exists():
+                return True
+    return False
+
+
+def install_theme_icons(slug, candidates):
+    """Install the icon into the hicolor theme at every standard size.
+
+    Referencing an icon by NAME lets the desktop pick the right size per
+    context; pointing Icon= at a path makes it draw the image at native size.
+    But that only helps if small sizes exist - plenty of .exe files embed a
+    single 256px icon, so anything missing gets generated by downscaling.
+    """
+    base = hicolor_dir()
+    if not candidates:
+        return {}
+
+    # Work from the highest-resolution image available, then render every size
+    # through the same padding pass so they look consistent with each other and
+    # with the rest of the desktop.
+    sized = [(icon_dimensions(p), p) for p in candidates]
+    sized = [(s, p) for s, p in sized if s]
+    if sized:
+        source_size, source = max(sized, key=lambda sp: sp[0])
+    else:
+        source = max(candidates, key=lambda p: p.stat().st_size)
+        source_size = 256
+
+    installed = {}
+    for size in STANDARD_ICON_SIZES:
+        if size > max(source_size, 48):
+            continue
+        dest = base / f"{size}x{size}" / "apps" / f"exerunner-{slug}.png"
+        if scale_png(source, dest, size):
+            installed[size] = "generated"
+
+    # No image tooling available at all - keep the raw file so there is at
+    # least something rather than falling back to a generic cog.
+    if not installed:
+        dest = base / f"{source_size}x{source_size}" / "apps" / f"exerunner-{slug}.png"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(source, dest)
+            installed[source_size] = "unpadded"
+        except OSError:
+            pass
+
+    if installed:
+        capture(["gtk-update-icon-cache", "-f", "-t", str(base)])
+    return installed
+
+
+def installed_icon_sizes(slug):
+    """Which sizes are actually present in the theme for this app."""
+    sizes = []
+    for path in hicolor_dir().glob(f"*/apps/exerunner-{slug}.png"):
+        match = re.match(r"(\d+)x\d+$", path.parent.parent.name)
+        if match:
+            sizes.append(int(match.group(1)))
+    return sorted(sizes)
+
+
+def remove_theme_icons(slug):
+    base = hicolor_dir()
+    if not base.is_dir():
+        return
+    for path in base.glob(f"*/apps/exerunner-{slug}.png"):
+        path.unlink(missing_ok=True)
+    capture(["gtk-update-icon-cache", "-f", "-t", str(base)])
+
+
+def icon_spec(slug):
+    """What to put after Icon= - a theme name if we have one, else a path."""
+    if installed_icon_sizes(slug):
+        return f"exerunner-{slug}"
+    stored = app_dir(slug) / "icon.png"
+    return str(stored) if stored.exists() else "application-x-executable"
+
+
+def report_icon_result(slug):
+    """Say exactly what happened, so a wrong-looking icon is diagnosable."""
+    sizes = installed_icon_sizes(slug)
+    if sizes:
+        ok(f"Icon installed at {len(sizes)} sizes: {', '.join(f'{s}px' for s in sizes)}")
+        if max(sizes) < 48:
+            warn("The app only provides a small icon, so it may look soft when enlarged.")
+    else:
+        warn("No icon could be installed - the menu entry will use a generic one.")
+        if not which("wrestool") or not which("icotool"):
+            warn("  icoutils is missing:  sudo apt install icoutils")
+        else:
+            warn("  This .exe appears to contain no icon resources.")
+        warn("  You can supply your own:  exerunner desktop <app> --icon picture.png")
+    return sizes
+
+
+def desktop_dir():
+    """The user's Desktop, honouring XDG relocation and localisation."""
+    code, out = capture(["xdg-user-dir", "DESKTOP"], timeout=5)
+    if code == 0 and out.strip():
+        path = Path(out.strip())
+        if path.is_dir():
+            return path
+    return Path.home() / "Desktop"
+
+
+def installer_wanted_desktop_icon(prefix):
+    """Did the installer drop a shortcut on the prefix's Windows desktop?
+
+    exerunner disables winemenubuilder, so Wine never acts on these - but their
+    presence is a clear signal the app expects a desktop icon.
+    """
+    prefix = Path(prefix)
+    for users in (prefix / "drive_c" / "users").glob("*"):
+        desktop = users / "Desktop"
+        if desktop.is_dir():
+            for lnk in desktop.glob("*.lnk"):
+                if not is_not_the_app(lnk.name):
+                    return True
+    return False
+
+
+def desktop_shortcut_path(manifest):
+    return desktop_dir() / f"exerunner-{manifest['slug']}.desktop"
+
+
+def write_desktop_shortcut(manifest):
+    path = desktop_shortcut_path(manifest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    launcher = sys.argv[0] if os.path.isabs(sys.argv[0]) else shutil.which("exerunner") or "exerunner"
+
+    lines = [
+        "[Desktop Entry]",
+        "Type=Application",
+        f"Name={manifest['name']}",
+        "Comment=Windows application (exerunner)",
+        f"Exec={launcher} run {manifest['slug']}",
+        f"Icon={icon_spec(manifest['slug'])}",
+        "Terminal=false",
+        "Categories=Application;Wine;",
+        f"StartupWMClass={Path(manifest['exe']).stem}",
+        "",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    path.chmod(0o755)
+
+    # Cinnamon and GNOME show "untrusted launcher" until the file is marked.
+    capture(["gio", "set", str(path), "metadata::trusted", "true"])
+    return path
+
+
+def remove_desktop_shortcut(slug):
+    path = desktop_dir() / f"exerunner-{slug}.desktop"
+    if path.exists():
+        path.unlink()
+        return True
+    return False
+
+
+def write_desktop_entry(manifest):
+    DESKTOP_DIR.mkdir(parents=True, exist_ok=True)
+    slug = manifest["slug"]
+    entry = DESKTOP_DIR / f"exerunner-{slug}.desktop"
+    lines = [
+        "[Desktop Entry]",
+        "Type=Application",
+        f"Name={manifest['name']}",
+        f"Comment=Windows application (exerunner, prefix: {slug})",
+        f"Exec={sys.argv[0] if os.path.isabs(sys.argv[0]) else 'exerunner'} run {slug}",
+        f"Icon={icon_spec(slug)}",
+        "Terminal=false",
+        "Categories=Application;Wine;",
+        f"StartupWMClass={Path(manifest['exe']).stem}",
+        "",
+    ]
+    entry.write_text("\n".join(lines), encoding="utf-8")
+    entry.chmod(0o755)
+    capture(["update-desktop-database", str(DESKTOP_DIR)])
+    return entry
+
+
+def remove_desktop_entry(slug):
+    entry = DESKTOP_DIR / f"exerunner-{slug}.desktop"
+    if entry.exists():
+        entry.unlink()
+        capture(["update-desktop-database", str(DESKTOP_DIR)])
+
+
+# --------------------------------------------------------------------------
+# doctor
+# --------------------------------------------------------------------------
+
+
+def ubuntu_codename():
+    try:
+        text = Path("/etc/os-release").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(r"^UBUNTU_CODENAME=(\S+)", text, re.M)
+    return match.group(1) if match else None
+
+
+def cmd_doctor(args):
+    problems, notes = [], []
+    print(f"{_c('1', 'exerunner doctor')}  (v{VERSION})\n")
+
+    # --- distro ---------------------------------------------------------
+    try:
+        os_release = Path("/etc/os-release").read_text(encoding="utf-8")
+        pretty = re.search(r'^PRETTY_NAME="?([^"\n]+)', os_release, re.M)
+        info(f"System: {pretty.group(1) if pretty else 'unknown'}")
+    except OSError:
+        warn("Cannot read /etc/os-release - this tool targets Linux Mint / Ubuntu.")
+    codename = ubuntu_codename() or "<your-ubuntu-codename>"
+
+    # --- wine -----------------------------------------------------------
+    wine = which("wine")
+    if not wine:
+        problems.append(
+            "Wine is not installed.\n"
+            "      Use the WineHQ repository, not Mint's - Mint ships an old Wine and\n"
+            "      that alone causes most 'it just doesn't work' failures:\n"
+            "        sudo dpkg --add-architecture i386\n"
+            "        sudo mkdir -pm755 /etc/apt/keyrings\n"
+            "        sudo wget -O /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key\n"
+            f"        sudo wget -NP /etc/apt/sources.list.d/ https://dl.winehq.org/wine-builds/ubuntu/dists/{codename}/winehq-{codename}.sources\n"
+            "        sudo apt update && sudo apt install --install-recommends winehq-staging"
+        )
+    else:
+        code, out = capture([wine, "--version"])
+        version = out.splitlines()[0] if out else "unknown"
+        ok(f"Wine: {version}  ({wine})")
+        major = re.search(r"wine-(\d+)", version)
+        if major and int(major.group(1)) < 9:
+            notes.append(
+                f"Wine {major.group(1)} is old. Wine 9+ fixes a large number of app and game\n"
+                "      failures; upgrading is the single highest-value change you can make."
+            )
+        if "/usr/bin/wine" == wine:
+            rc, _ = capture(["dpkg", "-s", "winehq-staging"])
+            rc2, _ = capture(["dpkg", "-s", "winehq-stable"])
+            if rc != 0 and rc2 != 0:
+                notes.append(
+                    "Your Wine looks like Mint's distro package rather than WineHQ's.\n"
+                    "      The WineHQ build is newer and noticeably more compatible."
+                )
+
+    # --- 32-bit support -------------------------------------------------
+    code, out = capture(["dpkg", "--print-foreign-architectures"])
+    if code == 0 and "i386" not in out:
+        problems.append(
+            "32-bit support is not enabled. Plenty of Windows apps are still 32-bit,\n"
+            "      and without this they fail with confusing ntdll/loader errors:\n"
+            "        sudo dpkg --add-architecture i386 && sudo apt update"
+        )
+    elif code == 0:
+        ok("32-bit (i386) architecture enabled")
+
+    # --- winetricks -----------------------------------------------------
+    winetricks = which("winetricks")
+    if not winetricks:
+        problems.append(
+            "winetricks is missing. It installs the Visual C++ / .NET / font runtimes\n"
+            "      that most Windows apps assume are already present:\n"
+            "        sudo apt install winetricks"
+        )
+    else:
+        _, out = capture([winetricks, "--version"])
+        # winetricks prints trace lines ("Executing cd /usr/bin") before its
+        # version, so pick the line that actually starts with a date stamp.
+        match = re.search(r"^(\d{8})[\s-]", out or "", re.M)
+        ok(f"winetricks: {match.group(1) if match else 'installed'}")
+        if match:
+            age_days = (datetime.now() - datetime.strptime(match.group(1), "%Y%m%d")).days
+            if age_days > 400:
+                notes.append(
+                    f"winetricks is about {age_days} days old; its download URLs rot over time.\n"
+                    "      Refresh it with: sudo winetricks --self-update"
+                )
+
+    # --- winetricks' own dependencies -----------------------------------
+    for tool, package, why in (
+        ("cabextract", "cabextract", "unpacking Microsoft runtime installers"),
+        ("7z", "p7zip-full", "unpacking some installers"),
+        ("unzip", "unzip", "unpacking some installers"),
+        ("wrestool", "icoutils", "pulling icons out of .exe files for menu entries"),
+    ):
+        if which(tool):
+            ok(f"{tool}: present")
+        else:
+            notes.append(f"'{tool}' missing ({why}): sudo apt install {package}")
+
+    # --- graphics -------------------------------------------------------
+    icd = list(Path("/usr/share/vulkan/icd.d").glob("*.json")) if Path("/usr/share/vulkan/icd.d").is_dir() else []
+    if icd:
+        ok(f"Vulkan drivers: {len(icd)} ICD file(s) found")
+    else:
+        notes.append(
+            "No Vulkan drivers detected. DXVK (which makes DirectX games and some\n"
+            "      apps dramatically faster and more reliable) needs them:\n"
+            "        sudo apt install mesa-vulkan-drivers mesa-vulkan-drivers:i386 vulkan-tools"
+        )
+
+    # --- virtual machine ------------------------------------------------
+    _, virt = capture(["systemd-detect-virt"])
+    if virt and virt not in ("none",) and "not found" not in virt.lower():
+        notes.append(
+            f"Running inside a virtual machine ({virt}). Ordinary desktop software\n"
+            "      will behave normally, but 3D graphics go through an emulated GPU,\n"
+            "      so DirectX games will be slow or will fail in ways they would not\n"
+            "      on real hardware. Do not judge game compatibility from in here."
+        )
+
+    # --- fonts ----------------------------------------------------------
+    if which("fc-list"):
+        _, out = capture(["fc-list"])
+        if "Liberation" not in out and "DejaVu" not in out:
+            notes.append("Few system fonts detected; text in Windows apps may render badly.")
+        else:
+            ok("System fonts present")
+
+    # --- exerunner's own state ------------------------------------------
+    apps = all_apps()
+    info(f"exerunner apps installed: {len(apps)}")
+    extra_runners = [r for r in list_runners() if r != "system"]
+    info(f"Extra Wine runners: {', '.join(extra_runners) if extra_runners else 'none (using system wine)'}")
+    if DATA.exists():
+        total = sum(f.stat().st_size for f in DATA.rglob("*") if f.is_file())
+        info(f"Disk used by prefixes: {human(total)}  ({DATA})")
+
+    # --- the shared-prefix trap ------------------------------------------
+    if (Path.home() / ".wine").is_dir():
+        notes.append(
+            "You have a default ~/.wine prefix. Installing everything into that one\n"
+            "      shared prefix is the most common reason Wine 'stops working' - apps\n"
+            "      overwrite each other's runtimes. exerunner gives each app its own."
+        )
+
+    print()
+    if problems:
+        print(_c("1;31", f"{len(problems)} blocking problem(s):"))
+        for i, item in enumerate(problems, 1):
+            print(f"  {i}. {item}\n")
+    if notes:
+        print(_c("1;33", f"{len(notes)} recommendation(s):"))
+        for i, item in enumerate(notes, 1):
+            print(f"  {i}. {item}\n")
+    if not problems and not notes:
+        print(_c("1;32", "Everything checks out. You are ready to install Windows apps."))
+    elif not problems:
+        print(_c("32", "No blockers - you can install apps now."))
+    return 1 if problems else 0
+
+
+# --------------------------------------------------------------------------
+# install
+# --------------------------------------------------------------------------
+
+
+def resolve_tricks(preset, tricks):
+    verbs = list(PRESETS.get(preset, []))
+    for extra in tricks or []:
+        for verb in extra.split(","):
+            verb = verb.strip()
+            if verb and verb not in verbs:
+                verbs.append(verb)
+    return verbs
+
+
+def cmd_install(args):
+    source = Path(args.exe).expanduser().resolve()
+    if not source.is_file():
+        die(f"No such file: {source}")
+
+    if REDIST_INSTALLER.search(source.name):
+        print()
+        warn(f"'{source.name}' looks like a Microsoft redistributable installer.")
+        warn("Those cannot work under Wine - they pull their payload through Windows")
+        warn("Update, which does not exist here. Wine already implements DirectX; what")
+        warn("apps actually need are the helper DLLs, and winetricks installs those:")
+        warn("")
+        warn("    exerunner deps <app> --preset directx     (d3dx, d3dcompiler, xact)")
+        warn("    exerunner deps <app> --preset game        (the above plus DXVK)")
+        warn("    exerunner deps <app> --preset full        (everything commonly needed)")
+        print()
+        if not args.yes and not ask_yes("Install it as an app anyway?", default=False):
+            return 1
+
+    name = args.name or name_from_filename(source.stem)
+    slug = args.slug or slugify(name)
+    target = app_dir(slug)
+    if target.exists() and not args.force:
+        die(f"'{slug}' already exists. Use --force to reinstall, or --slug to pick another name.")
+    if target.exists():
+        shutil.rmtree(target)
+
+    portable = args.portable
+    if not portable and not args.installer:
+        looks_like_installer = bool(re.search(r"(setup|install|_inst|-inst)", source.name, re.I))
+        portable = not (looks_like_installer or ask_yes(
+            f"Is '{source.name}' an installer (it will install the app somewhere)?", default=True
+        ))
+
+    prefix = target / "prefix"
+    log_path = target / "logs" / "install.log"
+    arch = "win32" if args.arch == "32" else "win64"
+    verbs = resolve_tricks(args.preset, args.tricks)
+
+    print()
+    info(f"Name:    {name}")
+    info(f"Prefix:  {prefix}")
+    info(f"Arch:    {arch}   Runner: {args.runner}   Windows version: {args.winver}")
+    info(f"Runtime: {', '.join(verbs) if verbs else '(none)'}")
+    info(f"Mode:    {'portable (copy in place)' if portable else 'run installer'}")
+    print()
+
+    info("Creating an isolated Wine prefix ...")
+    if create_prefix(prefix, args.runner, arch, log_path, no_gecko=args.no_gecko, no_mono=args.no_mono) != 0:
+        warn("wineboot reported an error - continuing, but check the log if things break.")
+
+    if verbs:
+        info(f"Installing runtime components: {', '.join(verbs)}")
+        info("(this downloads from Microsoft and friends; it can take several minutes)")
+        run_winetricks(prefix, args.runner, verbs, log_path)
+
+    if args.winver:
+        info(f"Setting Windows version to {args.winver}")
+        set_winver(prefix, args.runner, args.winver, log_path)
+
+    started = time.time()
+    env, wine = wine_env(prefix, args.runner)
+
+    if portable:
+        if args.in_place:
+            # Wine can run an executable from anywhere on the filesystem, so a
+            # large game does not need to be duplicated into the prefix.
+            main_exe = source
+            ok(f"Running in place from {main_exe.parent} (nothing copied)")
+        else:
+            dest_dir = prefix / "drive_c" / "apps" / slug
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            if args.with_folder:
+                size = sum(f.stat().st_size for f in source.parent.rglob("*") if f.is_file())
+                info(f"Copying {source.parent} into the prefix ({human(size)}) ...")
+                for item in source.parent.iterdir():
+                    destination = dest_dir / item.name
+                    if item.is_dir():
+                        shutil.copytree(item, destination, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(item, destination)
+            else:
+                siblings = [p for p in source.parent.iterdir() if p.name != source.name]
+                if siblings:
+                    warn(f"{len(siblings)} other item(s) sit next to {source.name} and are NOT being copied.")
+                    warn("If this app needs its data files, it will crash on launch. Re-run with")
+                    warn("--with-folder to copy them too, or --in-place to leave everything where it is.")
+                shutil.copy2(source, dest_dir / source.name)
+            main_exe = dest_dir / source.name
+            ok(f"Placed at {main_exe}")
+    else:
+        info("Running the installer inside the prefix ...")
+        info("(the installer's own window will appear - complete it as you would on Windows)")
+        stream([wine, str(source)] + list(args.args or []), env=env, cwd=source.parent, log_path=log_path)
+        if not wait_idle(env):
+            info("The installer handed off to the app, which is still running - carrying on.")
+
+        candidates = find_candidates(prefix, since=started)
+        if not candidates:
+            warn("Could not find an installed .exe in the prefix.")
+            warn("Either the installer failed, or it put the app somewhere unusual.")
+            manual = ask("Path to the app's .exe inside the prefix (blank to abort)")
+            if not manual:
+                die("Aborted. The prefix is kept at " + str(prefix))
+            main_exe = Path(manual).expanduser()
+        elif len(candidates) == 1 or args.yes:
+            main_exe = candidates[0]
+            ok(f"Found: {main_exe.name}")
+        else:
+            print()
+            info("Which one launches the app?")
+            for i, candidate in enumerate(candidates[:12], 1):
+                rel = candidate.relative_to(prefix / "drive_c")
+                size = human(candidate.stat().st_size)
+                print(f"   {i:2}. {candidate.name}  ({size})  {rel.parent}")
+            choice = ask("Number", "1")
+            try:
+                main_exe = candidates[int(choice) - 1]
+            except (ValueError, IndexError):
+                die("Invalid selection.")
+
+    manifest = {
+        "slug": slug,
+        "name": name,
+        "exe": str(main_exe),
+        "args": list(args.args or []) if portable else [],
+        "workdir": str(main_exe.parent),
+        "prefix": str(prefix),
+        "runner": args.runner,
+        "arch": arch,
+        "winver": args.winver,
+        "tricks": verbs,
+        "env": {},
+        "source": str(source),
+        "created": datetime.now().isoformat(timespec="seconds"),
+    }
+    save_app(manifest)
+
+    extract_icon(main_exe, target / "icon.png", slug=slug)
+    report_icon_result(slug)
+
+    entry = write_desktop_entry(manifest)
+    ok(f"Menu entry: {entry}")
+
+    # Desktop shortcut. Default to yes when the installer clearly wanted one,
+    # since exerunner disables winemenubuilder and Wine never created it.
+    wanted = installer_wanted_desktop_icon(prefix)
+    if args.no_desktop:
+        make_shortcut = False
+    elif args.desktop:
+        make_shortcut = True
+    elif args.yes:
+        make_shortcut = wanted
+    else:
+        if wanted:
+            info("The installer asked for a desktop shortcut.")
+        make_shortcut = ask_yes("Put an icon on your desktop too?", default=wanted)
+
+    if make_shortcut:
+        shortcut = write_desktop_shortcut(manifest)
+        ok(f"Desktop icon: {shortcut}")
+
+    print()
+    ok(f"Installed '{name}' as '{slug}'")
+    print(f"     Launch it:  exerunner run {slug}")
+    print(f"     Or find '{name}' in the Cinnamon menu.")
+    print(f"     If it misbehaves:  exerunner logs {slug}   /   exerunner shell {slug} --winecfg")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# run / list / remove / shell / logs
+# --------------------------------------------------------------------------
+
+
+def cmd_run(args):
+    manifest = load_app(args.name)
+    exe = Path(manifest["exe"])
+    if not exe.is_file():
+        die(f"The executable is gone: {exe}")
+
+    env, wine = wine_env(
+        manifest["prefix"],
+        manifest.get("runner", "system"),
+        extra=manifest.get("env"),
+        debug=args.wine_debug,
+    )
+    log_path = app_dir(manifest["slug"]) / "logs" / "last.log"
+    # A fresh log per launch, so `exerunner logs` always shows the run that failed.
+    if log_path.exists():
+        log_path.unlink()
+
+    cmd = [wine, str(exe)] + list(manifest.get("args") or []) + list(args.args or [])
+    info(f"Launching {manifest['name']} ...")
+    code = stream(
+        cmd,
+        env=env,
+        cwd=manifest.get("workdir") or exe.parent,
+        log_path=log_path,
+        on_line=(lambda line: None) if not args.verbose else None,
+    )
+    if code != 0:
+        fail(f"{manifest['name']} exited with code {code}")
+        print(f"     Log: {log_path}")
+        print(f"     See it: exerunner logs {manifest['slug']}")
+    return code
+
+
+def cmd_list(args):
+    apps = all_apps()
+    if not apps:
+        print("No apps installed yet.  exerunner install /path/to/setup.exe")
+        return 0
+    width = max(len(a["slug"]) for a in apps)
+    print(f"{'SLUG'.ljust(width)}  {'NAME'.ljust(28)}  RUNNER    ARCH   RUNTIME")
+    for app in apps:
+        size = ""
+        prefix = Path(app["prefix"])
+        if args.size and prefix.is_dir():
+            total = sum(f.stat().st_size for f in prefix.rglob("*") if f.is_file())
+            size = f"  {human(total)}"
+        tricks = ",".join(app.get("tricks") or []) or "-"
+        print(
+            f"{app['slug'].ljust(width)}  {app['name'][:28].ljust(28)}  "
+            f"{app.get('runner', 'system')[:8].ljust(8)}  {app.get('arch', '?').ljust(5)}  {tricks}{size}"
+        )
+    return 0
+
+
+def cmd_remove(args):
+    # An install that died partway leaves a directory and a multi-GB prefix but
+    # no manifest. Insisting on a manifest here would make the broken installs -
+    # exactly the ones worth deleting - the only ones that cannot be removed.
+    target = app_dir(args.name)
+    manifest = None
+    path = manifest_path(args.name)
+    if path.exists():
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            warn("manifest.json is corrupt - removing the directory anyway.")
+
+    if not target.is_dir():
+        die(f"No app or leftover directory called '{args.name}'. Run: exerunner list")
+
+    name = manifest["name"] if manifest else args.name
+    if manifest is None:
+        warn(f"'{args.name}' has no manifest - a partial or failed install.")
+
+    total = sum(f.stat().st_size for f in target.rglob("*") if f.is_file())
+    if not args.yes:
+        print(f"This deletes {target} ({human(total)}) including the app's entire prefix.")
+        if not ask_yes(f"Remove '{name}'?", default=False):
+            print("Cancelled.")
+            return 1
+
+    remove_desktop_entry(args.name)
+    remove_theme_icons(args.name)
+    if remove_desktop_shortcut(args.name):
+        info("Removed the desktop icon too.")
+    shutil.rmtree(target, ignore_errors=True)
+    ok(f"Removed {name} ({human(total)} freed)")
+    return 0
+
+
+def cmd_desktop(args):
+    manifest = load_app(args.name)
+
+    if args.remove:
+        if remove_desktop_shortcut(manifest["slug"]):
+            ok(f"Removed the desktop icon for {manifest['name']}")
+        else:
+            info("There was no desktop icon to remove.")
+        return 0
+
+    icon = app_dir(manifest["slug"]) / "icon.png"
+    # Apps installed before theme icons existed have a lone oversized icon.png,
+    # which desktops draw at native size. Re-extract so they get every size.
+    has_theme_icon = icon_spec(manifest["slug"]).startswith("exerunner-")
+
+    if args.icon:
+        source = Path(args.icon).expanduser()
+        if not source.is_file():
+            die(f"No such image: {source}")
+        shutil.copy2(source, icon)
+        # A hand-supplied image has no size in its name, so drop any theme
+        # icons and let icon_spec fall back to this file.
+        remove_theme_icons(manifest["slug"])
+        ok(f"Icon set from {source}")
+        write_desktop_entry(manifest)
+    elif not icon.exists() or not has_theme_icon or args.refresh:
+        info("Extracting the icon and generating every size ...")
+        remove_theme_icons(manifest["slug"])
+        extract_icon(Path(manifest["exe"]), icon, slug=manifest["slug"])
+        report_icon_result(manifest["slug"])
+        write_desktop_entry(manifest)
+
+    path = write_desktop_shortcut(manifest)
+    ok(f"Desktop icon: {path}")
+    return 0
+
+
+def cmd_shell(args):
+    manifest = load_app(args.name)
+    env, wine = wine_env(manifest["prefix"], manifest.get("runner", "system"))
+    prefix = Path(manifest["prefix"])
+
+    if args.winecfg:
+        return subprocess.call([wine, "winecfg"], env=env)
+    if args.regedit:
+        return subprocess.call([wine, "regedit"], env=env)
+    if args.explorer:
+        return subprocess.call([wine, "explorer"], env=env)
+    if args.files:
+        return subprocess.call(["xdg-open", str(prefix / "drive_c")])
+    if args.winetricks:
+        winetricks = which("winetricks")
+        if not winetricks:
+            die("winetricks is not installed: sudo apt install winetricks")
+        verbs = resolve_tricks(args.preset, args.tricks) if (args.preset or args.tricks) else []
+        code = subprocess.call([winetricks] + (["-q"] if verbs else []) + verbs, env=env)
+        if verbs and code == 0:
+            manifest["tricks"] = sorted(set((manifest.get("tricks") or []) + verbs))
+            save_app(manifest)
+            ok(f"Recorded runtime components: {', '.join(verbs)}")
+        return code
+    if args.exec:
+        return subprocess.call([wine] + list(args.exec), env=env, cwd=prefix / "drive_c")
+    if args.kill:
+        return subprocess.call([env.get("WINESERVER", "wineserver"), "-k"], env=env)
+
+    # Default: an interactive shell with the prefix already wired up.
+    print(f"Shell inside the '{manifest['slug']}' prefix. WINEPREFIX and WINE are set; 'exit' to leave.")
+    env["PS1"] = f"({manifest['slug']}) \\w $ "
+    return subprocess.call([os.environ.get("SHELL", "/bin/bash")], env=env, cwd=prefix / "drive_c")
+
+
+def cmd_deps(args):
+    manifest = load_app(args.name)
+
+    if args.list:
+        installed = manifest.get("tricks") or []
+        print(f"{manifest['name']}  ({manifest['slug']})")
+        print(f"  installed: {', '.join(installed) if installed else '(none)'}\n")
+        print("Presets:")
+        for key, verbs in sorted(PRESETS.items()):
+            print(f"  {key.ljust(8)} {', '.join(verbs) if verbs else '(nothing)'}")
+        print("\nAny winetricks verb also works:  exerunner deps <app> --tricks mfc42,dotnet48")
+        return 0
+
+    verbs = resolve_tricks(args.preset, args.tricks)
+    if not verbs:
+        die("Nothing requested. Use --preset <name>, --tricks <verb,verb>, or --list.")
+
+    if args.preset == "full":
+        warn("'full' installs a great deal and takes a long time. It is occasionally")
+        warn("counter-productive - some runtime combinations conflict. Prefer a narrower")
+        warn("preset unless you are troubleshooting a stubborn app.")
+        if not args.yes and not ask_yes("Continue?", default=True):
+            return 1
+
+    already = set(manifest.get("tricks") or [])
+    todo = verbs if args.force else [v for v in verbs if v not in already]
+    skipped = [v for v in verbs if v in already]
+    if skipped and not args.force:
+        info(f"Already present, skipping: {', '.join(skipped)}")
+    if not todo:
+        ok("Everything requested is already installed. Use --force to reinstall.")
+        return 0
+
+    info(f"Installing into the '{manifest['slug']}' prefix: {', '.join(todo)}")
+    log_path = app_dir(manifest["slug"]) / "logs" / "install.log"
+    code = run_winetricks(manifest["prefix"], manifest.get("runner", "system"), todo, log_path)
+    if code == 0:
+        manifest["tricks"] = sorted(already | set(todo))
+        save_app(manifest)
+        ok(f"Added: {', '.join(todo)}")
+    else:
+        fail(f"winetricks exited with {code}")
+        print(f"     Details: exerunner logs {manifest['slug']} --install")
+    return code
+
+
+def cmd_logs(args):
+    manifest = load_app(args.name)
+    logs = app_dir(manifest["slug"]) / "logs"
+    path = logs / ("install.log" if args.install else "last.log")
+    if not path.exists():
+        die(f"No log at {path} yet - run the app once first.")
+    if args.follow:
+        return subprocess.call(["tail", "-f", str(path)])
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    if args.errors:
+        interesting = [
+            line for line in lines
+            if re.search(r"(err:|fixme:.*stub|Unhandled exception|not found|failed|cannot|0x[0-9a-f]{8})", line, re.I)
+        ]
+        if not interesting:
+            print("No obvious errors in the log.")
+            return 0
+        print("\n".join(interesting[-args.lines:]))
+        return 0
+    print("\n".join(lines[-args.lines:]))
+    print(f"\n({path})")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# runners
+# --------------------------------------------------------------------------
+
+RUNNER_SOURCES = {
+    "wine-ge": "GloriousEggroll/wine-ge-custom",
+    "proton-ge": "GloriousEggroll/proton-ge-custom",
+    "kron4ek": "Kron4ek/Wine-Builds",
+}
+
+
+def github_releases(repo, limit=8):
+    url = f"https://api.github.com/repos/{repo}/releases?per_page={limit}"
+    request = urllib.request.Request(url, headers={"User-Agent": f"exerunner/{VERSION}", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def download(url, dest):
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and dest.stat().st_size > 0:
+        info(f"Using cached download: {dest.name}")
+        return dest
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    request = urllib.request.Request(url, headers={"User-Agent": f"exerunner/{VERSION}"})
+    with urllib.request.urlopen(request, timeout=60) as response, tmp.open("wb") as out:
+        total = int(response.headers.get("Content-Length") or 0)
+        done = 0
+        while True:
+            chunk = response.read(256 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+            done += len(chunk)
+            if _tty:
+                bar = f"{human(done)}" + (f" / {human(total)}" if total else "")
+                print(f"\r   downloading {bar}   ", end="", flush=True)
+    if _tty:
+        print()
+    tmp.rename(dest)
+    return dest
+
+
+def cmd_runners(args):
+    if args.action == "list":
+        print("Installed runners:")
+        for name in list_runners():
+            root = runner_root(name)
+            if name == "system":
+                wine = which("wine")
+                _, version = capture([wine, "--version"]) if wine else (1, "not installed")
+                print(f"  system      {version or 'not installed'}")
+            else:
+                _, version = capture([str(root / "bin" / "wine"), "--version"])
+                print(f"  {name.ljust(11)} {version or '?'}   {root}")
+        print("\nAvailable sources for `exerunner runners search <source>`:")
+        for key, repo in RUNNER_SOURCES.items():
+            print(f"  {key.ljust(11)} {repo}")
+        return 0
+
+    if args.action == "search":
+        repo = RUNNER_SOURCES.get(args.target, args.target)
+        try:
+            releases = github_releases(repo)
+        except urllib.error.HTTPError as exc:
+            die(f"GitHub returned {exc.code} for {repo}. Check the repository name.")
+        except urllib.error.URLError as exc:
+            die(f"Could not reach GitHub: {exc.reason}")
+        for release in releases:
+            assets = [a for a in release.get("assets", []) if a["name"].endswith((".tar.xz", ".tar.gz", ".tar.zst"))]
+            if not assets:
+                continue
+            print(f"\n{_c('1', release['tag_name'])}   {release.get('published_at', '')[:10]}")
+            for asset in assets:
+                print(f"   {asset['name']}   ({human(asset['size'])})")
+                print(f"     exerunner runners add {slugify(asset['name'].rsplit('.tar', 1)[0])} {asset['browser_download_url']}")
+        return 0
+
+    if args.action == "add":
+        if not args.url:
+            die("Usage: exerunner runners add <name> <url-to-tarball>")
+        name = slugify(args.target)
+        dest = RUNNERS / name
+        if dest.exists() and not args.force:
+            die(f"Runner '{name}' already exists. Use --force to replace it.")
+        archive = download(args.url, CACHE / Path(args.url).name)
+        if archive.name.endswith(".tar.zst") and not which("zstd"):
+            die("This archive is zstd-compressed: sudo apt install zstd")
+        shutil.rmtree(dest, ignore_errors=True)
+        dest.mkdir(parents=True, exist_ok=True)
+        info(f"Extracting to {dest} ...")
+        if archive.name.endswith(".tar.zst"):
+            subprocess.run(["tar", "--use-compress-program=unzstd", "-xf", str(archive), "-C", str(dest)], check=True)
+        else:
+            with tarfile.open(archive) as tar:
+                try:
+                    tar.extractall(dest, filter="data")  # Python 3.12+
+                except TypeError:
+                    tar.extractall(dest)
+        root = runner_root(name)
+        if not root:
+            shutil.rmtree(dest, ignore_errors=True)
+            die("That archive does not contain a bin/wine - it is not a Wine build exerunner understands.")
+        _, version = capture([str(root / "bin" / "wine"), "--version"])
+        ok(f"Installed runner '{name}'  ({version})")
+        print(f"     Use it:  exerunner install app.exe --runner {name}")
+        return 0
+
+    if args.action == "rm":
+        dest = RUNNERS / slugify(args.target)
+        if not dest.is_dir():
+            die(f"No runner called '{args.target}'")
+        shutil.rmtree(dest, ignore_errors=True)
+        ok(f"Removed runner {args.target}")
+        return 0
+
+    return 1
+
+
+# --------------------------------------------------------------------------
+# open (double-click handler)
+# --------------------------------------------------------------------------
+
+
+def gui_available():
+    """A display plus working PyGObject - both required for the wizard."""
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    try:
+        import gi
+
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk  # noqa: F401
+    except (ImportError, ValueError):
+        return False
+    return True
+
+
+def cmd_open(args):
+    source = Path(args.exe).expanduser().resolve()
+    if not source.is_file():
+        die(f"No such file: {source}")
+
+    # Double-clicking a .exe should feel like an installer, not a terminal.
+    if not args.no_gui and not args.app and gui_available():
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        try:
+            import exerunner_gui
+
+            return exerunner_gui.wizard(sys.modules[__name__], str(source))
+        except ImportError:
+            pass  # fall through to the text flow
+
+    if args.app:
+        manifest = load_app(args.app)
+        env, wine = wine_env(manifest["prefix"], manifest.get("runner", "system"))
+        info(f"Running {source.name} inside the '{manifest['slug']}' prefix")
+        return stream([wine, str(source)], env=env, cwd=source.parent,
+                      log_path=app_dir(manifest["slug"]) / "logs" / "last.log")
+
+    apps = all_apps()
+    print(f"\n{_c('1', source.name)}\n")
+    print("  1. Install it as a new app (own prefix, menu entry, kept)   [recommended]")
+    print("  2. Run it once in a throwaway prefix")
+    for i, app in enumerate(apps, 3):
+        print(f"  {i}. Run it inside '{app['name']}' prefix")
+    choice = ask("\nChoice", "1")
+
+    if choice == "1":
+        args.name = None
+        args.slug = None
+        args.runner = "system"
+        args.arch = "64"
+        args.winver = "win10"
+        args.preset = "app"
+        args.tricks = []
+        args.portable = False
+        args.installer = False
+        args.with_folder = False
+        args.in_place = False
+        args.desktop = False
+        args.no_desktop = False
+        args.force = False
+        args.yes = False
+        args.no_gecko = False
+        args.no_mono = False
+        args.args = []
+        return cmd_install(args)
+
+    if choice == "2":
+        scratch = CACHE / "scratch-prefix"
+        info(f"Throwaway prefix at {scratch} (delete it any time)")
+        if not scratch.exists():
+            create_prefix(scratch, "system", "win64", CACHE / "scratch.log")
+        env, wine = wine_env(scratch, "system")
+        return stream([wine, str(source)], env=env, cwd=source.parent, log_path=CACHE / "scratch.log")
+
+    try:
+        manifest = apps[int(choice) - 3]
+    except (ValueError, IndexError):
+        die("Invalid selection.")
+    env, wine = wine_env(manifest["prefix"], manifest.get("runner", "system"))
+    return stream([wine, str(source)], env=env, cwd=source.parent,
+                  log_path=app_dir(manifest["slug"]) / "logs" / "last.log")
+
+
+# --------------------------------------------------------------------------
+# gui
+# --------------------------------------------------------------------------
+
+
+def cmd_gui(args):
+    here = Path(__file__).resolve().parent
+    sys.path.insert(0, str(here))
+    try:
+        import exerunner_gui
+    except ImportError as exc:
+        die(f"Could not load the GUI ({exc}). Install PyGObject: sudo apt install python3-gi gir1.2-gtk-3.0")
+    return exerunner_gui.main(sys.modules[__name__])
+
+
+# --------------------------------------------------------------------------
+# argument parsing
+# --------------------------------------------------------------------------
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="exerunner",
+        description="Run Windows .exe files on Linux Mint, one clean Wine prefix per app.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Start with:  exerunner doctor",
+    )
+    parser.add_argument("--version", action="version", version=f"exerunner {VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("doctor", help="check the system can run Windows apps")
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("install", help="install an app into its own prefix")
+    p.add_argument("exe", help="path to the installer or portable .exe")
+    p.add_argument("--name", help="display name (defaults to the filename)")
+    p.add_argument("--slug", help="short id used for the prefix directory")
+    p.add_argument("--runner", default="system", help="wine build to use (see: exerunner runners list)")
+    p.add_argument("--arch", choices=["32", "64"], default="64", help="prefix architecture (default 64)")
+    p.add_argument("--winver", default="win10", help="Windows version to report, e.g. win10, win7, winxp")
+    p.add_argument("--preset", choices=sorted(PRESETS), default="app", help="runtime bundle to preinstall")
+    p.add_argument("--tricks", action="append", help="extra winetricks verbs, comma separated")
+    p.add_argument("--portable", action="store_true", help="the .exe runs directly, no installer")
+    p.add_argument("--installer", action="store_true", help="the .exe is an installer (skip the prompt)")
+    p.add_argument("--with-folder", action="store_true", help="portable: copy the whole containing folder")
+    p.add_argument("--in-place", action="store_true",
+                   help="portable: run it where it already lives, copying nothing (best for large games)")
+    p.add_argument("--no-gecko", action="store_true", help="suppress Wine's Gecko download prompt")
+    p.add_argument("--no-mono", action="store_true", help="suppress Wine's Mono download prompt")
+    p.add_argument("--force", action="store_true", help="replace an existing app of the same slug")
+    p.add_argument("--desktop", action="store_true", help="always add a desktop icon, no prompt")
+    p.add_argument("--no-desktop", action="store_true", help="never add a desktop icon, no prompt")
+    p.add_argument("-y", "--yes", action="store_true", help="accept the best-guess executable")
+    p.add_argument("args", nargs="*", help="arguments passed to the installer/app")
+    p.set_defaults(func=cmd_install)
+
+    p = sub.add_parser("run", help="launch an installed app")
+    p.add_argument("name")
+    p.add_argument("-v", "--verbose", action="store_true", help="echo Wine output to the terminal")
+    p.add_argument("--wine-debug", help="value for WINEDEBUG, e.g. +loaddll or warn+all")
+    p.add_argument("args", nargs="*", help="extra arguments for this launch")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("list", help="list installed apps")
+    p.add_argument("--size", action="store_true", help="also show disk usage (slower)")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("rm", help="remove an app and its prefix")
+    p.add_argument("name")
+    p.add_argument("-y", "--yes", action="store_true")
+    p.set_defaults(func=cmd_remove)
+
+    p = sub.add_parser("shell", help="open winecfg/regedit/a shell inside an app's prefix")
+    p.add_argument("name")
+    p.add_argument("--winecfg", action="store_true", help="Wine configuration for this app")
+    p.add_argument("--regedit", action="store_true", help="registry editor for this app")
+    p.add_argument("--explorer", action="store_true", help="Wine's file explorer")
+    p.add_argument("--files", action="store_true", help="open drive_c in your file manager")
+    p.add_argument("--winetricks", action="store_true", help="winetricks against this prefix")
+    p.add_argument("--preset", choices=sorted(PRESETS), help="with --winetricks: install a bundle")
+    p.add_argument("--tricks", action="append", help="with --winetricks: specific verbs")
+    p.add_argument("--kill", action="store_true", help="force-stop everything in this prefix")
+    p.add_argument("--exec", nargs=argparse.REMAINDER, help="run a command inside the prefix")
+    p.set_defaults(func=cmd_shell)
+
+    p = sub.add_parser("desktop", help="put an icon for an installed app on your desktop")
+    p.add_argument("name")
+    p.add_argument("--remove", action="store_true", help="take the desktop icon away again")
+    p.add_argument("--icon", help="use this image instead of the extracted one")
+    p.add_argument("--refresh", action="store_true", help="re-extract and regenerate every icon size")
+    p.set_defaults(func=cmd_desktop)
+
+    p = sub.add_parser("deps", help="add runtimes (DirectX helpers, VC++, .NET) to an installed app")
+    p.add_argument("name")
+    p.add_argument("--preset", choices=sorted(PRESETS), help="a bundle, e.g. directx / game / full")
+    p.add_argument("--tricks", action="append", help="specific winetricks verbs, comma separated")
+    p.add_argument("--list", action="store_true", help="show what is installed and list the presets")
+    p.add_argument("--force", action="store_true", help="reinstall even if already recorded")
+    p.add_argument("-y", "--yes", action="store_true")
+    p.set_defaults(func=cmd_deps)
+
+    p = sub.add_parser("logs", help="show an app's log")
+    p.add_argument("name")
+    p.add_argument("-n", "--lines", type=int, default=60)
+    p.add_argument("-f", "--follow", action="store_true")
+    p.add_argument("-e", "--errors", action="store_true", help="only lines that look like errors")
+    p.add_argument("--install", action="store_true", help="show the install log instead")
+    p.set_defaults(func=cmd_logs)
+
+    p = sub.add_parser("runners", help="manage alternative Wine builds")
+    p.add_argument("action", choices=["list", "search", "add", "rm"])
+    p.add_argument("target", nargs="?", help="runner name, or a source key for 'search'")
+    p.add_argument("url", nargs="?", help="tarball URL for 'add'")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_runners)
+
+    p = sub.add_parser("open", help="run a loose .exe (used as the double-click handler)")
+    p.add_argument("exe")
+    p.add_argument("--app", help="run it inside this installed app's prefix")
+    p.add_argument("--no-gui", action="store_true", help="use the text flow even if a display is available")
+    p.set_defaults(func=cmd_open)
+
+    p = sub.add_parser("gui", help="graphical front end")
+    p.set_defaults(func=cmd_gui)
+
+    return parser
+
+
+def main(argv=None):
+    for directory in (APPS, RUNNERS, CACHE):
+        directory.mkdir(parents=True, exist_ok=True)
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args) or 0
+    except KeyboardInterrupt:
+        print()
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

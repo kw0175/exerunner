@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+"""
+winedoctor - read a Wine log and say, in English, what actually went wrong.
+
+Wine's failures are far more patterned than they look. A log that appears to be
+4,000 lines of noise usually contains two or three lines that determine
+everything, and each maps to a known fix. This turns those lines into an
+explanation and a command.
+
+  winedoctor app.log                 explain what went wrong
+  winedoctor app.log --fix           explain, then offer to apply the fixes
+  wine app.exe 2>&1 | winedoctor -   read from a pipe
+  winedoctor --app notepad           use an exerunner app's last log
+
+Exit codes: 0 nothing blocking found, 1 blocking problems found, 2 usage error.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+from collections import OrderedDict
+from pathlib import Path
+
+VERSION = "0.1.0"
+
+# --------------------------------------------------------------------------
+# The knowledge. This table is the whole value of the tool - everything else
+# is plumbing. Each entry turns a log signature into a diagnosis.
+#
+#   severity : blocking  - the app cannot run until this is fixed
+#              likely    - probably why it misbehaves, worth fixing
+#              info      - normal Wine noise, explained so it stops worrying you
+#   fix      : winetricks verbs, or None when there is nothing to install
+# --------------------------------------------------------------------------
+
+# Missing-DLL lookups. Wine names the DLL; this says which package provides it.
+DLL_FIXES = {
+    # Visual C++ runtimes - by far the most common cause of "it just closes"
+    r"^msvcp?1[45]0(_\d+)?$":       ("vcrun2022", "Visual C++ 2015-2022 runtime"),
+    r"^vcruntime140(_\d+)?$":       ("vcrun2022", "Visual C++ 2015-2022 runtime"),
+    r"^msvcp120$|^msvcr120$":       ("vcrun2013", "Visual C++ 2013 runtime"),
+    r"^msvcp110$|^msvcr110$":       ("vcrun2012", "Visual C++ 2012 runtime"),
+    r"^msvcp100$|^msvcr100$":       ("vcrun2010", "Visual C++ 2010 runtime"),
+    r"^msvcp90$|^msvcr90$":         ("vcrun2008", "Visual C++ 2008 runtime"),
+    r"^msvcp80$|^msvcr80$":         ("vcrun2005", "Visual C++ 2005 runtime"),
+    r"^api-ms-win-crt-":            ("vcrun2022", "Universal C Runtime"),
+    r"^mfc42u?$":                   ("mfc42", "MFC 4.2 runtime"),
+
+    # DirectX helper libraries - NOT DirectX itself, which Wine implements
+    r"^d3dx9(_\d+)?$":              ("d3dx9", "Direct3D 9 helper libraries"),
+    r"^d3dx10(_\d+)?$":             ("d3dx10", "Direct3D 10 helper libraries"),
+    r"^d3dx11(_\d+)?$":             ("d3dx11_43", "Direct3D 11 helper libraries"),
+    r"^d3dcompiler_4[37]$":         ("d3dcompiler_47", "Direct3D shader compiler"),
+    r"^xactengine|^xaudio2":        ("xact", "XACT / XAudio2 game audio"),
+    r"^x3daudio":                   ("xact", "X3DAudio"),
+    r"^xinput1_\d$":                ("xact", "XInput controller support"),
+
+    # Media and document stack
+    r"^mfplat$|^mf$|^mfreadwrite$": ("mf", "Media Foundation"),
+    r"^quartz$":                    ("quartz", "DirectShow"),
+    r"^devenum$":                   ("devenum", "DirectShow device enumerator"),
+    r"^gdiplus$":                   ("gdiplus", "GDI+ graphics"),
+    r"^msxml[3-6]$":                ("msxml6", "MSXML parser"),
+    r"^riched20$|^riched32$":       ("riched20", "Rich Edit control"),
+    r"^wininet$":                   ("wininet", "WinINet HTTP stack"),
+    r"^dotnetfx|^mscoree$":         ("dotnet48", ".NET Framework"),
+    r"^physx":                      ("physx", "PhysX runtime"),
+    r"^openal32$":                  ("openal", "OpenAL audio"),
+}
+
+SIGNATURES = [
+    # ---- blocking: missing DLLs -----------------------------------------
+    {
+        "id": "import-dll",
+        "pattern": re.compile(r"err:module:import_dll Library ([\w\-.]+?)\.dll not found", re.I),
+        "severity": "blocking",
+        "title": "A required DLL is missing",
+        "explain": (
+            "The app links against a Windows library that is not present in this "
+            "prefix. Wine cannot ship these - they are Microsoft redistributables - "
+            "so they have to be installed per prefix."
+        ),
+        "dll_group": 1,
+    },
+    {
+        "id": "ldr-init-failed",
+        "pattern": re.compile(r'err:module:LdrInitializeThunk Importing dlls for L"([^"]+)" failed', re.I),
+        "severity": "blocking",
+        "title": "The app could not start because a dependency failed to load",
+        "explain": (
+            "This is the summary line that follows a missing DLL. Look for the "
+            "import_dll errors above it - those name the actual missing library."
+        ),
+    },
+    {
+        "id": "dotnet-missing",
+        "pattern": re.compile(
+            r"(Could not load file or assembly|mscoree\.dll not found|"
+            r"System\.(IO|Runtime)\.\w+Exception|Failed to initialize the \.NET|clr\.dll)", re.I),
+        "severity": "blocking",
+        "title": "This app needs the .NET Framework",
+        "explain": (
+            "The app is managed code and the runtime is absent. Installing .NET is "
+            "slow - budget several minutes - and it is worth being sure this is "
+            "really the problem before starting."
+        ),
+        "fix": ["dotnet48"],
+    },
+    {
+        "id": "status-dll-not-found",
+        # STATUS_DLL_NOT_FOUND. Generic - it means *a* dependency is missing, not
+        # which one. Claiming .NET from this alone sends people to install a large
+        # runtime they may not need.
+        "pattern": re.compile(r"status\s+(?:0x)?c0000135", re.I),
+        "severity": "blocking",
+        "title": "The app exited because a dependency was missing (0xc0000135)",
+        "explain": (
+            "STATUS_DLL_NOT_FOUND. This is the consequence, not the cause - it does "
+            "not say which library. The import_dll errors above name the actual "
+            "missing DLLs. If there are none, run again with WINEDEBUG=+loaddll to "
+            "see what the loader was looking for."
+        ),
+        "hint": "exerunner run <app> --wine-debug +loaddll -v",
+    },
+
+    # ---- blocking: the program never started ----------------------------
+    {
+        "id": "file-not-found",
+        "pattern": re.compile(r"wine: (?:cannot find|could not load|failed to open) L?[\"']?([^\"'\n]+)", re.I),
+        "severity": "blocking",
+        "title": "Wine could not find the program you asked it to run",
+        "explain": (
+            "The path does not exist. Note that Wine looks inside this prefix's fake "
+            "C: drive, so a relative name is resolved against the prefix, not your "
+            "Linux working directory. Give the full Linux path to the .exe."
+        ),
+        "hint": "Check with: ls -l <the file>   and pass an absolute path.",
+    },
+    {
+        "id": "no-application-associated",
+        "pattern": re.compile(r"Application could not be started, or no application associated", re.I),
+        "severity": "blocking",
+        "title": "Wine could not launch what you gave it",
+        "explain": (
+            "Most often the path simply does not exist - check that first, since Wine "
+            "words this failure the same way whether the file is missing or merely "
+            "unlaunchable. Otherwise it may be a document or shortcut rather than an "
+            "executable, or a 64-bit binary in a 32-bit prefix."
+        ),
+        "hint": "Confirm it exists first:  ls -l <the file>",
+    },
+    {
+        "id": "not-an-executable",
+        "pattern": re.compile(r"(is not a valid Win32 application|Bad EXE format|err:process:exec_process)", re.I),
+        "severity": "blocking",
+        "title": "That file is not a Windows executable Wine can run",
+        "explain": (
+            "Either it is corrupt, it is a 16-bit or ARM binary, or it is not really "
+            "an .exe. A 64-bit binary also fails in a 32-bit (win32) prefix."
+        ),
+        "hint": "Check what it actually is with: file <the exe>",
+    },
+
+    # ---- blocking: environment ------------------------------------------
+    {
+        "id": "no-display-driver",
+        "pattern": re.compile(r"err:winediag:nodrv_CreateWindow (?:Application tried to create a window, but no driver|.*could not be loaded)", re.I),
+        "severity": "blocking",
+        "title": "Wine has no display driver",
+        "explain": (
+            "Wine could not open a window at all. Either DISPLAY is not set (you are "
+            "in a session with no graphical server), or Wine's X11/Wayland driver is "
+            "missing. On a headless machine this is expected."
+        ),
+        "hint": "Check that $DISPLAY is set, or install the wine-x11 / wine components for your distro.",
+    },
+    {
+        "id": "wineprefix-arch",
+        "pattern": re.compile(r"WINEARCH set to win32 but .* is a 64-bit installation|wineserver: could not exec", re.I),
+        "severity": "blocking",
+        "title": "Prefix architecture mismatch",
+        "explain": (
+            "WINEARCH does not match the prefix that already exists. Architecture is "
+            "fixed when a prefix is created and cannot be changed afterwards."
+        ),
+        "hint": "Delete the prefix and recreate it with the architecture you want.",
+    },
+    {
+        "id": "prefix-update-needed",
+        "pattern": re.compile(r"wine: configuration in .* has been updated|The Wine configuration in .* is being updated", re.I),
+        "severity": "info",
+        "title": "The prefix was created or upgraded",
+        "explain": "Normal on first run, or after a Wine version change. Not a problem.",
+    },
+
+    # ---- likely: graphics -----------------------------------------------
+    {
+        "id": "vulkan-missing",
+        "pattern": re.compile(r"(err:vulkan|Failed to load vulkan|No Vulkan driver|vkGetInstanceProcAddr.*failed)", re.I),
+        "severity": "likely",
+        "title": "Vulkan is unavailable",
+        "explain": (
+            "DXVK and vkd3d need Vulkan. Either the drivers are missing, or you are "
+            "in a VM - VirtualBox and most VMs provide no Vulkan at all, so DXVK "
+            "cannot work there regardless of what you install."
+        ),
+        "hint": "On real hardware: sudo apt install mesa-vulkan-drivers mesa-vulkan-drivers:i386 vulkan-tools",
+    },
+    {
+        "id": "opengl-init",
+        "pattern": re.compile(r"err:winediag:X11DRV_WineGL_InitOpenglInfo|Direct rendering is disabled", re.I),
+        "severity": "likely",
+        "title": "OpenGL is not working properly",
+        "explain": (
+            "Wine fell back to software rendering, which is why everything is slow. "
+            "Usually a missing or misconfigured graphics driver, or a VM."
+        ),
+        "hint": "Check with: glxinfo | grep 'direct rendering'",
+    },
+    {
+        "id": "d3d-fallback",
+        "pattern": re.compile(r"fixme:d3d:.*not supported|err:d3d:wined3d_", re.I),
+        "severity": "info",
+        "title": "Direct3D features are being emulated or skipped",
+        "explain": (
+            "Wine logs these constantly and they are usually harmless. Only worth "
+            "chasing if you are seeing actual visual corruption."
+        ),
+    },
+
+    # ---- likely: audio, network, crypto ---------------------------------
+    {
+        "id": "audio-endpoint",
+        "pattern": re.compile(r"err:winediag:AUDDRV_GetAudioEndpoint|Failed to initialise audio", re.I),
+        "severity": "likely",
+        "title": "Audio device could not be opened",
+        "explain": "Wine could not reach PulseAudio or PipeWire. The app may run silently or refuse to start.",
+        "hint": "Check the Audio tab in winecfg, and that sound works elsewhere in the guest.",
+    },
+    {
+        "id": "gnutls",
+        "pattern": re.compile(r"err:winediag:(gnutls_initialize|schannel).*(failed|not found)", re.I),
+        "severity": "likely",
+        "title": "TLS support is missing",
+        "explain": "Anything using HTTPS - logins, updaters, activation - will fail.",
+        "hint": "sudo apt install libgnutls30:i386 libgnutls30",
+    },
+    {
+        "id": "gecko-missing",
+        "pattern": re.compile(r"Could not find Wine Gecko|wine_gecko.*not installed", re.I),
+        "severity": "likely",
+        "title": "Wine Gecko (the built-in browser engine) is absent",
+        "explain": (
+            "Apps that embed a web view will show blank panels. Harmless if the app "
+            "never displays web content."
+        ),
+        "hint": "Let Wine download it when prompted, or: winetricks mshtml",
+    },
+
+    # ---- crashes ---------------------------------------------------------
+    {
+        "id": "page-fault",
+        "pattern": re.compile(r"wine: Unhandled page fault on (read|write|execute) access to ([0-9A-Fa-fx]+)", re.I),
+        "severity": "blocking",
+        "title": "The app crashed with a memory access violation",
+        "explain": (
+            "The Windows equivalent of a segfault. On its own this says little - the "
+            "useful information is whatever went wrong just before it. Look further up."
+        ),
+    },
+    {
+        "id": "unimplemented",
+        "pattern": re.compile(r"wine: Call from .* to unimplemented function ([\w.]+)", re.I),
+        "severity": "blocking",
+        "title": "The app called a Windows function Wine has not implemented",
+        "explain": (
+            "A genuine Wine gap, not something you can install your way out of. A "
+            "newer Wine version may have it - this is exactly what wine-staging and "
+            "Proton often fix first."
+        ),
+        "hint": "Try a newer runner, and search appdb.winehq.org for the app.",
+    },
+    {
+        "id": "critical-section",
+        "pattern": re.compile(r"err:ntdll:RtlpWaitForCriticalSection.*deadlock", re.I),
+        "severity": "likely",
+        "title": "The app is deadlocked waiting on a lock",
+        "explain": "Often a timing bug that shows up under Wine. Sometimes fixed by a different Wine version.",
+    },
+    {
+        "id": "ole-not-registered",
+        "pattern": re.compile(r"err:ole:(CoGetClassObject|create_server) class \{?([0-9A-Fa-f\-]+)\}? not registered", re.I),
+        "severity": "likely",
+        "title": "A COM component the app expects is not registered",
+        "explain": (
+            "Usually a side effect of a missing runtime rather than the root cause. "
+            "Fix any missing DLLs first, then re-check."
+        ),
+    },
+
+    # ---- noise, explained -------------------------------------------------
+    {
+        "id": "fixme-stub",
+        "pattern": re.compile(r"^fixme:", re.I),
+        "severity": "info",
+        "title": "fixme: messages",
+        "explain": (
+            "Wine logging that something is stubbed or partially implemented. These "
+            "appear in their hundreds even when an app works perfectly. Ignore unless "
+            "you are debugging a specific misbehaviour."
+        ),
+        "count_only": True,
+    },
+]
+
+# --------------------------------------------------------------------------
+# output
+# --------------------------------------------------------------------------
+
+_tty = sys.stdout.isatty()
+
+
+def _c(code, s):
+    return f"\033[{code}m{s}\033[0m" if _tty else s
+
+
+SEVERITY_STYLE = {
+    "blocking": ("31;1", "BLOCKING"),
+    "likely": ("33;1", "LIKELY  "),
+    "unknown": ("35;1", "UNKNOWN "),
+    "info": ("36", "INFO    "),
+}
+
+SEVERITY_ORDER = {"blocking": 0, "likely": 1, "unknown": 2, "info": 3}
+
+# Lines that are clearly reporting a failure. Anything matching this that no
+# signature explained gets surfaced as UNKNOWN rather than silently dropped -
+# reporting "0 blocking" for a log full of unexplained errors would be worse
+# than useless.
+ERROR_SHAPED = re.compile(
+    r"^\s*(err:|fatal:|wine: |Unhandled exception|Application tried to)", re.I)
+
+
+def wrap(text, width=76, indent="    "):
+    words, lines, current = text.split(), [], ""
+    for word in words:
+        if len(current) + len(word) + 1 > width:
+            lines.append(current)
+            current = word
+        else:
+            current = f"{current} {word}".strip()
+    if current:
+        lines.append(current)
+    return "\n".join(indent + line for line in lines)
+
+
+# --------------------------------------------------------------------------
+# analysis
+# --------------------------------------------------------------------------
+
+
+def dll_to_fix(dll_name):
+    """Map a missing DLL to a winetricks verb and a human description."""
+    name = dll_name.lower().removesuffix(".dll")
+    for pattern, (verb, description) in DLL_FIXES.items():
+        if re.search(pattern, name):
+            return verb, description
+    return None, None
+
+
+def analyse(lines):
+    """Return findings, ordered by severity then first appearance."""
+    findings = OrderedDict()
+    matched_lines = set()
+
+    for number, line in enumerate(lines, 1):
+        for sig in SIGNATURES:
+            match = sig["pattern"].search(line)
+            if not match:
+                continue
+
+            matched_lines.add(number)
+            key = sig["id"]
+            entry = findings.setdefault(key, {
+                "sig": sig,
+                "count": 0,
+                "first_line": number,
+                "samples": [],
+                "dlls": OrderedDict(),
+                "fixes": OrderedDict(),
+                "unknown_dlls": [],
+            })
+            entry["count"] += 1
+
+            if len(entry["samples"]) < 3:
+                entry["samples"].append((number, line.strip()[:200]))
+
+            # A missing-DLL signature carries its own fix in the capture group.
+            if "dll_group" in sig:
+                dll = match.group(sig["dll_group"])
+                if dll not in entry["dlls"]:
+                    verb, description = dll_to_fix(dll)
+                    entry["dlls"][dll] = (verb, description)
+                    if verb:
+                        entry["fixes"][verb] = description
+                    else:
+                        entry["unknown_dlls"].append(dll)
+
+            for verb in sig.get("fix", []):
+                entry["fixes"].setdefault(verb, "")
+
+    # Anything error-shaped that no signature explained. Silence here would read
+    # as "all clear", which is the one thing this tool must never do.
+    unexplained = [
+        (number, line.strip()[:200])
+        for number, line in enumerate(lines, 1)
+        if number not in matched_lines and ERROR_SHAPED.search(line)
+    ]
+
+    if unexplained:
+        findings["unrecognised"] = {
+            "sig": {
+                "id": "unrecognised",
+                "severity": "unknown",
+                "title": f"{len(unexplained)} error line(s) winedoctor cannot explain",
+                "explain": (
+                    "These look like failures but match no known signature, so treat "
+                    "the summary above as incomplete. If you work out what one of "
+                    "these means, add a signature so it is never a mystery again."
+                ),
+            },
+            "count": len(unexplained),
+            "first_line": unexplained[0][0],
+            "samples": unexplained[:5],
+            "dlls": OrderedDict(),
+            "fixes": OrderedDict(),
+            "unknown_dlls": [],
+        }
+
+    ordered = sorted(
+        findings.values(),
+        key=lambda e: (SEVERITY_ORDER[e["sig"]["severity"]], e["first_line"]),
+    )
+    return ordered
+
+
+def report(findings, show_info=True):
+    blocking = [f for f in findings if f["sig"]["severity"] == "blocking"]
+    likely = [f for f in findings if f["sig"]["severity"] == "likely"]
+    unknown = [f for f in findings if f["sig"]["severity"] == "unknown"]
+
+    print()
+    if not findings:
+        print(_c("32;1", "  No errors of any kind in this log."))
+        print("  Nothing failed, and nothing went unrecognised.")
+        print()
+        return set()
+
+    all_fixes = OrderedDict()
+
+    for entry in findings:
+        sig = entry["sig"]
+        if sig["severity"] == "info" and not show_info:
+            continue
+
+        colour, label = SEVERITY_STYLE[sig["severity"]]
+        occurrences = f"×{entry['count']}" if entry["count"] > 1 else ""
+        print(f"  {_c(colour, label)}  {_c('1', sig['title'])}  {_c('2', occurrences)}")
+        print(wrap(sig["explain"]))
+
+        if entry["dlls"]:
+            print()
+            for dll, (verb, description) in entry["dlls"].items():
+                if verb:
+                    print(f"      {_c('1', dll + '.dll')}  →  {description}  ({_c('36', verb)})")
+                else:
+                    print(f"      {_c('1', dll + '.dll')}  →  {_c('33', 'no known winetricks package')}")
+
+        if sig.get("hint"):
+            print()
+            print(wrap(_c("36", "→ " + sig["hint"])))
+
+        if not sig.get("count_only") and entry["samples"]:
+            print()
+            for number, text in entry["samples"][:2]:
+                print(f"      {_c('2', f'line {number}:')} {_c('2', text)}")
+
+        for verb, description in entry["fixes"].items():
+            all_fixes[verb] = description
+
+        print()
+
+    print("  " + "─" * 74)
+    info_count = len(findings) - len(blocking) - len(likely) - len(unknown)
+    summary = f"  {len(blocking)} blocking, {len(likely)} likely, {info_count} informational"
+    if unknown:
+        summary += _c("35;1", f", {unknown[0]['count']} UNEXPLAINED")
+    print(summary)
+
+    if unknown and not blocking:
+        print()
+        print(wrap(_c("35", "Nothing blocking was recognised, but there are errors above "
+                            "that winedoctor could not explain - so do not read this as "
+                            "a clean run."), indent="  "))
+
+    if all_fixes:
+        print()
+        print(_c("1", "  Suggested fix:"))
+        print()
+        print(f"      winetricks -q {' '.join(all_fixes)}")
+        print()
+        print("  Or, if this app is managed by exerunner:")
+        print()
+        print(f"      exerunner deps <app> --tricks {','.join(all_fixes)}")
+    print()
+
+    return set(all_fixes)
+
+
+# --------------------------------------------------------------------------
+# input
+# --------------------------------------------------------------------------
+
+
+def read_lines(args):
+    if args.app:
+        data = Path.home() / ".local/share/exerunner/apps" / args.app / "logs/last.log"
+        if not data.exists():
+            print(f"No exerunner log at {data}", file=sys.stderr)
+            sys.exit(2)
+        return data.read_text(encoding="utf-8", errors="replace").splitlines()
+
+    if not args.logfile or args.logfile == "-":
+        return sys.stdin.read().splitlines()
+
+    path = Path(args.logfile)
+    if not path.is_file():
+        print(f"No such file: {path}", file=sys.stderr)
+        sys.exit(2)
+    return path.read_text(encoding="utf-8", errors="replace").splitlines()
+
+
+def apply_fixes(verbs, prefix):
+    winetricks = shutil.which("winetricks")
+    if not winetricks:
+        print("winetricks is not installed:  sudo apt install winetricks", file=sys.stderr)
+        return 1
+
+    env = os.environ.copy()
+    if prefix:
+        env["WINEPREFIX"] = str(Path(prefix).expanduser())
+    if "WINEPREFIX" not in env:
+        print("No prefix given. Use --prefix, --app, or set WINEPREFIX.", file=sys.stderr)
+        return 2
+
+    print(f"\nInstalling into {env['WINEPREFIX']}: {', '.join(verbs)}\n")
+    return subprocess.call([winetricks, "-q", *verbs], env=env)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="winedoctor",
+        description="Read a Wine log and explain what actually went wrong.",
+    )
+    parser.add_argument("logfile", nargs="?", help="log file, or - for stdin")
+    parser.add_argument("--app", help="use this exerunner app's last log")
+    parser.add_argument("--prefix", help="WINEPREFIX to apply fixes to")
+    parser.add_argument("--fix", action="store_true", help="apply the suggested winetricks fixes")
+    parser.add_argument("--quiet", action="store_true", help="hide informational findings")
+    parser.add_argument("--version", action="version", version=f"winedoctor {VERSION}")
+    args = parser.parse_args()
+
+    lines = read_lines(args)
+    findings = analyse(lines)
+    fixes = report(findings, show_info=not args.quiet)
+
+    if args.fix and fixes:
+        prefix = args.prefix
+        if not prefix and args.app:
+            prefix = Path.home() / ".local/share/exerunner/apps" / args.app / "prefix"
+        return apply_fixes(sorted(fixes), prefix)
+
+    # Unexplained errors count as problems - the tool not knowing something is
+    # not evidence that nothing is wrong.
+    return 1 if any(f["sig"]["severity"] in ("blocking", "unknown") for f in findings) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
