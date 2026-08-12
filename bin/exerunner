@@ -745,6 +745,24 @@ def report_icon_result(slug):
     return sizes
 
 
+def launcher_command():
+    """The command a .desktop entry should call.
+
+    sys.argv[0] points at the Python file, which the installer writes
+    non-executable on purpose - it is meant to be run *by* the wrapper in
+    ~/.local/bin, not directly. A desktop entry pointing at it fails with a
+    permission error the moment you click the icon.
+    """
+    wrapper = Path.home() / ".local" / "bin" / "exerunner"
+    if wrapper.is_file() and os.access(wrapper, os.X_OK):
+        return str(wrapper)
+    found = shutil.which("exerunner")
+    if found:
+        return found
+    # Last resort: invoke this file through the interpreter that is running it.
+    return f"{sys.executable} {Path(__file__).resolve()}"
+
+
 def desktop_dir():
     """The user's Desktop, honouring XDG relocation and localisation."""
     code, out = capture(["xdg-user-dir", "DESKTOP"], timeout=5)
@@ -778,7 +796,7 @@ def desktop_shortcut_path(manifest):
 def write_desktop_shortcut(manifest):
     path = desktop_shortcut_path(manifest)
     path.parent.mkdir(parents=True, exist_ok=True)
-    launcher = sys.argv[0] if os.path.isabs(sys.argv[0]) else shutil.which("exerunner") or "exerunner"
+    launcher = launcher_command()
 
     lines = [
         "[Desktop Entry]",
@@ -817,7 +835,7 @@ def write_desktop_entry(manifest):
         "Type=Application",
         f"Name={manifest['name']}",
         f"Comment=Windows application (exerunner, prefix: {slug})",
-        f"Exec={sys.argv[0] if os.path.isabs(sys.argv[0]) else 'exerunner'} run {slug}",
+        f"Exec={launcher_command()} run {slug}",
         f"Icon={icon_spec(slug)}",
         "Terminal=false",
         "Categories=Application;Wine;",
@@ -1284,6 +1302,22 @@ def cmd_remove(args):
 
 
 def cmd_desktop(args):
+    if args.all:
+        apps = all_apps()
+        if not apps:
+            info("No apps installed yet.")
+            return 0
+        for manifest in apps:
+            write_desktop_entry(manifest)
+            if desktop_shortcut_path(manifest).exists():
+                write_desktop_shortcut(manifest)
+        capture(["update-desktop-database", str(DESKTOP_DIR)])
+        ok(f"Rewrote menu entries for {len(apps)} app(s) using {launcher_command()}")
+        return 0
+
+    if not args.name:
+        die("Give an app name, or --all to repair every entry. See: exerunner list")
+
     manifest = load_app(args.name)
 
     if args.remove:
@@ -1719,7 +1753,8 @@ def build_parser():
     p.set_defaults(func=cmd_shell)
 
     p = sub.add_parser("desktop", help="put an icon for an installed app on your desktop")
-    p.add_argument("name")
+    p.add_argument("name", nargs="?")
+    p.add_argument("--all", action="store_true", help="repair the menu entries of every installed app")
     p.add_argument("--remove", action="store_true", help="take the desktop icon away again")
     p.add_argument("--icon", help="use this image instead of the extracted one")
     p.add_argument("--refresh", action="store_true", help="re-extract and regenerate every icon size")
