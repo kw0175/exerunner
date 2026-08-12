@@ -428,6 +428,27 @@ def create_prefix(prefix, runner, arch, log_path, on_line=None, no_gecko=False, 
     return code
 
 
+def winetricks_verbs():
+    """Every verb this winetricks knows, or None if it cannot be determined."""
+    winetricks = which("winetricks")
+    if not winetricks:
+        return None
+    code, out = capture([winetricks, "list-all"], timeout=60)
+    if code != 0 or not out:
+        return None
+    # Each verb line starts with the verb itself; "===== dlls =====" headers
+    # and blank lines are the only other content.
+    found = set()
+    for line in out.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("="):
+            continue
+        token = stripped.split(None, 1)[0]
+        if re.fullmatch(r"[a-z0-9_.\-]+", token):
+            found.add(token)
+    return found or None
+
+
 def run_winetricks(prefix, runner, verbs, log_path, on_line=None):
     if not verbs:
         return 0
@@ -436,6 +457,21 @@ def run_winetricks(prefix, runner, verbs, log_path, on_line=None):
         warn("winetricks is not installed - skipping runtime install.")
         warn("  sudo apt install winetricks")
         return 127
+
+    # Given an unknown verb, winetricks prints its entire usage text and exits
+    # 1. Catching it here gives a one-line answer instead of a screenful.
+    known = winetricks_verbs()
+    if known:
+        unknown = [v for v in verbs if v not in known]
+        if unknown:
+            fail(f"winetricks has no verb called: {', '.join(unknown)}")
+            print("     See what exists:   winetricks list-all")
+            print("     Or use a preset:   exerunner deps <app> --list")
+            close = [v for v in known if any(u in v or v in u for u in unknown)]
+            if close:
+                print(f"     Did you mean:      {', '.join(sorted(close)[:8])}")
+            return 2
+
     env, _ = wine_env(prefix, runner)
     env["WINETRICKS_LATEST_VERSION_CHECK"] = "disabled"
     cmd = [winetricks, "-q", "--force"] + list(verbs)
@@ -1475,8 +1511,14 @@ def cmd_deps(args):
         manifest["tricks"] = sorted(already | set(todo))
         save_app(manifest)
         ok(f"Added: {', '.join(todo)}")
-    else:
-        fail(f"winetricks exited with {code}")
+        return 0
+
+    if code == 2:
+        return 2  # bad verb, already explained clearly
+
+    fail(f"winetricks exited with {code}")
+    # Same courtesy `run` gets - explain it rather than pointing at a log.
+    if not diagnose_log(log_path):
         print(f"     Details: exerunner logs {manifest['slug']} --install")
     return code
 
