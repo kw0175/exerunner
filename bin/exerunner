@@ -469,7 +469,14 @@ def run_winetricks(prefix, runner, verbs, log_path, on_line=None):
             print("     Or use a preset:   exerunner deps <app> --list")
             close = [v for v in known if any(u in v or v in u for u in unknown)]
             if close:
-                print(f"     Did you mean:      {', '.join(sorted(close)[:8])}")
+                # Newest first, then prefix matches ahead of substring ones.
+                # Plain alphabetical truncation hides vcrun2022 behind seven
+                # older versions, which is the opposite of helpful.
+                close.sort(reverse=True)
+                close.sort(key=lambda v: not any(v.startswith(u) for u in unknown))
+                shown = close[:8]
+                more = f"  (+{len(close) - len(shown)} more)" if len(close) > len(shown) else ""
+                print(f"     Did you mean:      {', '.join(shown)}{more}")
             return 2
 
     env, _ = wine_env(prefix, runner)
