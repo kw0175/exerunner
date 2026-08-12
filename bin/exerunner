@@ -745,6 +745,50 @@ def report_icon_result(slug):
     return sizes
 
 
+def winedoctor_module():
+    """winedoctor ships beside exerunner; load it so failures self-explain.
+
+    Returns None when it is not installed - diagnosis is a bonus, never a
+    requirement for exerunner to work.
+    """
+    # Both submodules are needed: the installed file is named "winedoctor"
+    # with no extension, so spec_from_file_location cannot infer a loader and
+    # SourceFileLoader has to be named explicitly.
+    import importlib.machinery
+    import importlib.util
+
+    here = Path(__file__).resolve().parent
+    for candidate in (here / "winedoctor", here / "winedoctor.py"):
+        if not candidate.is_file():
+            continue
+        try:
+            loader = importlib.machinery.SourceFileLoader("winedoctor", str(candidate))
+            spec = importlib.util.spec_from_loader("winedoctor", loader)
+            module = importlib.util.module_from_spec(spec)
+            loader.exec_module(module)
+            return module
+        except Exception as exc:  # never fatal - diagnosis is a bonus
+            if os.environ.get("EXERUNNER_DEBUG"):
+                warn(f"Could not load winedoctor from {candidate}: {exc}")
+            return None
+    return None
+
+
+def diagnose_log(log_path, quiet=True):
+    """Run winedoctor over a log. Returns True if it printed a diagnosis."""
+    doctor = winedoctor_module()
+    if doctor is None:
+        return False
+    path = Path(log_path)
+    if not path.is_file():
+        return False
+    findings = doctor.analyse(path.read_text(encoding="utf-8", errors="replace").splitlines())
+    if not findings:
+        return False
+    doctor.report(findings, show_info=not quiet)
+    return True
+
+
 def launcher_command():
     """The command a .desktop entry should call.
 
@@ -1239,8 +1283,10 @@ def cmd_run(args):
     )
     if code != 0:
         fail(f"{manifest['name']} exited with code {code}")
-        print(f"     Log: {log_path}")
-        print(f"     See it: exerunner logs {manifest['slug']}")
+        # Explain it here rather than making the user remember another command.
+        if not diagnose_log(log_path):
+            print(f"     Log: {log_path}")
+            print(f"     See it: exerunner logs {manifest['slug']} -e")
     return code
 
 
@@ -1443,6 +1489,14 @@ def cmd_logs(args):
         die(f"No log at {path} yet - run the app once first.")
     if args.follow:
         return subprocess.call(["tail", "-f", str(path)])
+
+    if args.explain:
+        if not diagnose_log(path, quiet=False):
+            if winedoctor_module() is None:
+                die("winedoctor is not installed alongside exerunner.")
+            print("Nothing in that log looks like a problem.")
+        return 0
+
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     if args.errors:
@@ -1769,7 +1823,9 @@ def build_parser():
     p.add_argument("-y", "--yes", action="store_true")
     p.set_defaults(func=cmd_deps)
 
-    p = sub.add_parser("logs", help="show an app's log")
+    p = sub.add_parser("logs", help="show an app's log, or explain what went wrong")
+    p.add_argument("--explain", action="store_true",
+                   help="run winedoctor over the log and say what went wrong")
     p.add_argument("name")
     p.add_argument("-n", "--lines", type=int, default=60)
     p.add_argument("-f", "--follow", action="store_true")

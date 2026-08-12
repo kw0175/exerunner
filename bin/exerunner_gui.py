@@ -500,11 +500,44 @@ class MainWindow(Gtk.Window):
             )
 
         def done(code):
-            self.statusbar.set_text(
-                f"{manifest['name']} exited with code {code}" if code else f"{manifest['name']} closed cleanly."
-            )
+            if code:
+                self.statusbar.set_text(f"{manifest['name']} exited with code {code}")
+                # Explain it immediately rather than leaving the user to
+                # discover that a separate diagnostic command exists.
+                self.diagnose(slug, only_if_findings=True)
+            else:
+                self.statusbar.set_text(f"{manifest['name']} closed cleanly.")
 
         TaskWindow(self, manifest["name"], work, on_done=done)
+
+    def diagnose(self, slug, only_if_findings=False):
+        import contextlib
+        import io
+        import re
+
+        log = core.app_dir(slug) / "logs" / "last.log"
+        if not log.exists():
+            if not only_if_findings:
+                self.error("No log yet - run the app once first.")
+            return
+
+        doctor = core.winedoctor_module()
+        if doctor is None:
+            if not only_if_findings:
+                self.error("winedoctor is not installed alongside exerunner.")
+            return
+
+        findings = doctor.analyse(log.read_text(encoding="utf-8", errors="replace").splitlines())
+        serious = [f for f in findings if f["sig"]["severity"] in ("blocking", "likely", "unknown")]
+        if only_if_findings and not serious:
+            return
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            doctor.report(findings, show_info=not serious)
+        # report() colours its output when stdout is a terminal; strip that.
+        text = re.sub(r"\x1b\[[0-9;]*m", "", captured.getvalue())
+        self.show_text_window(f"What went wrong - {slug}", text or "Nothing looks wrong in that log.")
 
     def on_click(self, view, event):
         if event.button != 3:  # right click
@@ -535,6 +568,7 @@ class MainWindow(Gtk.Window):
         item("Registry editor...", lambda: self.prefix_tool(manifest, "regedit"))
         item("Open prefix folder", lambda: self.prefix_tool(manifest, "files"))
         menu.append(Gtk.SeparatorMenuItem())
+        item("Why did it fail?", lambda: self.diagnose(slug))
         item("View last log", lambda: self.show_log(slug))
         item("Force-stop this app", lambda: self.prefix_tool(manifest, "kill"))
         menu.append(Gtk.SeparatorMenuItem())
@@ -569,23 +603,28 @@ class MainWindow(Gtk.Window):
         else:
             subprocess.Popen([wine, tool], env=env)
 
+    def show_text_window(self, title, text):
+        window = Gtk.Window(title=title, transient_for=self)
+        window.set_default_size(780, 520)
+        buffer = Gtk.TextBuffer()
+        buffer.set_text(text[-200000:])
+        view = Gtk.TextView(buffer=buffer, editable=False, monospace=True)
+        view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        view.set_left_margin(10)
+        view.set_top_margin(10)
+        scroller = Gtk.ScrolledWindow()
+        scroller.add(view)
+        window.add(scroller)
+        window.show_all()
+
     def show_log(self, slug):
         path = core.app_dir(slug) / "logs" / "last.log"
         if not path.exists():
             self.error("No log yet - run the app once.")
             return
-        text = path.read_text(encoding="utf-8", errors="replace")
-
-        window = Gtk.Window(title=f"Log - {slug}", transient_for=self)
-        window.set_default_size(760, 480)
-        buffer = Gtk.TextBuffer()
-        buffer.set_text(text[-200000:])
-        view = Gtk.TextView(buffer=buffer, editable=False, monospace=True)
-        view.set_wrap_mode(Gtk.WrapMode.CHAR)
-        scroller = Gtk.ScrolledWindow()
-        scroller.add(view)
-        window.add(scroller)
-        window.show_all()
+        self.show_text_window(
+            f"Log - {slug}", path.read_text(encoding="utf-8", errors="replace")
+        )
 
     def remove(self, manifest):
         dialog = Gtk.MessageDialog(
