@@ -252,6 +252,37 @@ def stream(cmd, env=None, cwd=None, log_path=None, on_line=None):
     return proc.returncode
 
 
+def warm_prefix(env):
+    """Keep this prefix's wineserver resident so later launches start faster.
+
+    Costs a few MB of RAM per warmed prefix and saves prefix initialisation on
+    every subsequent launch. `wineserver -p` means persist indefinitely.
+    """
+    server = env.get("WINESERVER", "wineserver")
+    try:
+        subprocess.Popen(
+            [server, "-p"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except OSError:
+        return False
+
+
+def cool_prefix(env):
+    """Shut down a warmed wineserver, releasing its memory."""
+    server = env.get("WINESERVER", "wineserver")
+    try:
+        subprocess.run([server, "-k"], env=env, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=15, check=False)
+        return True
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def wait_idle(env, timeout=20):
     """Let the prefix settle, but never block indefinitely.
 
@@ -1315,6 +1346,12 @@ def cmd_run(args):
     if log_path.exists():
         log_path.unlink()
 
+    # wineserver normally exits a few seconds after the last program closes, so
+    # every launch pays for initialising the prefix again. Keeping it resident
+    # makes the second and later launches noticeably quicker.
+    if not args.no_warm:
+        warm_prefix(env)
+
     cmd = [wine, str(exe)] + list(manifest.get("args") or []) + list(args.args or [])
     info(f"Launching {manifest['name']} ...")
     code = stream(
@@ -1331,6 +1368,30 @@ def cmd_run(args):
             print(f"     Log: {log_path}")
             print(f"     See it: exerunner logs {manifest['slug']} -e")
     return code
+
+
+def cmd_warm(args):
+    """Pre-start wineserver so the first launch of the day is not the slow one."""
+    apps = all_apps() if args.all else [load_app(args.name)]
+    if not apps:
+        info("No apps installed yet.")
+        return 0
+
+    for manifest in apps:
+        env, _ = wine_env(manifest["prefix"], manifest.get("runner", "system"))
+        if args.stop:
+            cool_prefix(env)
+            ok(f"Stopped the background Wine process for {manifest['name']}")
+        elif warm_prefix(env):
+            ok(f"{manifest['name']} is warm - launches will be quicker")
+        else:
+            fail(f"Could not start wineserver for {manifest['name']}")
+
+    if not args.stop:
+        print()
+        print("     Each warmed prefix keeps a small background process alive.")
+        print("     Release them with:  exerunner warm --all --stop")
+    return 0
 
 
 def cmd_list(args):
@@ -1843,8 +1904,16 @@ def build_parser():
     p.add_argument("name")
     p.add_argument("-v", "--verbose", action="store_true", help="echo Wine output to the terminal")
     p.add_argument("--wine-debug", help="value for WINEDEBUG, e.g. +loaddll or warn+all")
+    p.add_argument("--no-warm", action="store_true",
+                   help="do not keep wineserver resident after the app closes")
     p.add_argument("args", nargs="*", help="extra arguments for this launch")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("warm", help="pre-start an app's Wine prefix so it launches faster")
+    p.add_argument("name", nargs="?")
+    p.add_argument("--all", action="store_true", help="warm every installed app")
+    p.add_argument("--stop", action="store_true", help="shut warmed prefixes down again")
+    p.set_defaults(func=cmd_warm)
 
     p = sub.add_parser("list", help="list installed apps")
     p.add_argument("--size", action="store_true", help="also show disk usage (slower)")
