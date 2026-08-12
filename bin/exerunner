@@ -1707,7 +1707,20 @@ def cmd_open(args):
     if not source.is_file():
         die(f"No such file: {source}")
 
-    # Double-clicking a .exe should feel like an installer, not a terminal.
+    # Already managed? Just run it. Double-clicking something you installed
+    # last week should launch it, not offer to install it a second time.
+    if not args.app:
+        target = str(source)
+        for manifest in all_apps():
+            if target in (manifest.get("source"), manifest.get("exe")):
+                info(f"{manifest['name']} is already installed - launching it.")
+                args.name = manifest["slug"]
+                args.args = []
+                args.verbose = False
+                args.wine_debug = None
+                return cmd_run(args)
+
+    # Otherwise it should feel like an installer, not a terminal.
     if not args.no_gui and not args.app and gui_available():
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         try:
